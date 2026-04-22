@@ -1,8 +1,10 @@
 """
-USTC Young 前端覆写代理服务
+USTC Young 前端覆写代理服务（纯标准库版本）
 
 在服务器端拦截并修改 young.ustc.edu.cn 的 API 响应，
 等效于电脑端 Chrome DevTools Override 的效果。
+
+零外部依赖，仅使用 Python 标准库。
 
 功能：
 1. 注入客户端补丁脚本（强制 showSignBtn/showSignOutBtn 返回 true）
@@ -13,10 +15,13 @@ USTC Young 前端覆写代理服务
 import json
 import logging
 import re
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from typing import Any
-from urllib.parse import urljoin, urlparse
-
-from aiohttp import web
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger("ustc_proxy")
 
@@ -59,11 +64,8 @@ INJECTION_SCRIPT = """
             const json = await resp.clone().json();
             if (json.success && json.message) {
                 console.log('[USTC-Proxy] 📷 截获到二维码! base64长度:', json.message.length);
-                // 存储到全局变量，供页面内组件使用
                 window.__ustc_qr_code = json.message;
-                // 触发自定义事件
                 window.dispatchEvent(new CustomEvent('ustc-qr-received', { detail: json.message }));
-                // 同时弹出浮层
                 showQRCodeOverlay(json.message);
             }
             return new Response(JSON.stringify(json), { status: 200, headers: resp.headers });
@@ -73,7 +75,6 @@ INJECTION_SCRIPT = """
 
     // ===== ④ Vue 补丁：强制按钮可见 =====
     function patchVue() {
-        const maxAttempts = 50;
         let attempts = 0;
         const interval = setInterval(() => {
             attempts++;
@@ -107,10 +108,7 @@ INJECTION_SCRIPT = """
                 } catch(e) { console.warn('[USTC-Proxy] ⚠️ Vue 补丁异常:', e); }
                 return;
             }
-            if (attempts >= maxAttempts) {
-                clearInterval(interval);
-                console.warn('[USTC-Proxy] ⚠️ Vue 补丁超时');
-            }
+            if (attempts >= 50) { clearInterval(interval); console.warn('[USTC-Proxy] ⚠️ Vue 补丁超时'); }
         }, 100);
     }
 
@@ -151,103 +149,8 @@ INJECTION_SCRIPT = """
 
 
 # ============================================================
-# HTTP 反向代理核心逻辑
+# 工具函数
 # ============================================================
-
-
-async def proxy_request(request: web.Request) -> web.StreamResponse:
-    """反向代理主入口：转发请求到 young.ustc.edu.cn 并选择性修改响应"""
-
-    # 构建目标 URL
-    path = request.path_qs
-    target_url = TARGET_BASE + path
-
-    logger.info(f"→ Proxy: {request.method} {path}")
-
-    # 准备转发头
-    forward_headers = {}
-    for key, value in request.headers.items():
-        # 跳过 hop-by-hop 头
-        if key.lower() in ('host', 'connection', 'transfer-encoding', 'content-length'):
-            continue
-        forward_headers[key] = value
-    forward_headers['Host'] = TARGET_HOST
-
-    # 读取请求体
-    body = None
-    if request.body_exists:
-        body = await request.read()
-
-    try:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=30)
-
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.request(
-                method=request.method,
-                url=target_url,
-                headers=forward_headers,
-                data=body,
-                allow_redirects=True,
-            ) as upstream_resp:
-
-                content_type = forward_headers.get('content-type', '') or ''
-
-                # ---- 特殊处理：HTML 页面 → 注入补丁脚本 ----
-                if is_html_content(content_type):
-                    html_body = await upstream_resp.text()
-                    modified_html = inject_script_into_html(html_body)
-                    return web.Response(
-                        text=modified_html,
-                        status=upstream_resp.status,
-                        content_type='text/html; charset=utf-8',
-                    )
-
-                # ---- 特殊处理：getButton API → 扩展按钮列表 ----
-                if is_get_button_request(path):
-                    api_body = await upstream_resp.text()
-                    modified_body = patch_get_button_response(api_body)
-                    return web.Response(
-                        text=modified_body,
-                        status=upstream_resp.status,
-                        content_type=content_type or 'application/json; charset=utf-8',
-                    )
-
-                # ---- 特殊处理：createWxaCodeUnlimit → 提取二维码 ----
-                if is_qr_code_request(path):
-                    api_body = await upstream_resp.text()
-                    log_qr_code_response(api_body)
-                    return web.Response(
-                        text=api_body,
-                        status=upstream_resp.status,
-                        content_type=content_type or 'application/json; charset=utf-8',
-                    )
-
-                # ---- 默认：原样转发 ----
-                resp_body = await upstream_resp.read()
-
-                response = web.Response(
-                    body=resp_body,
-                    status=upstream_resp.status,
-                )
-
-                # 复制响应头
-                for key, value in upstream_resp.headers.items():
-                    if key.lower() not in (
-                        'transfer-encoding', 'content-encoding',
-                        'content-length', 'connection',
-                    ):
-                        response.headers[key] = value
-
-                return response
-
-    except Exception as e:
-        logger.error(f"✗ 代理请求失败: {e}")
-        return web.Response(
-            text=f"Proxy Error: {str(e)}",
-            status=502,
-            content_type="text/plain",
-        )
 
 
 def is_html_content(content_type: str) -> bool:
@@ -267,66 +170,177 @@ def is_qr_code_request(path: str) -> bool:
 
 
 def inject_script_into_html(html: str) -> str:
-    """在 HTML 中注入补丁脚本（在 </head> 或 <body> 前）"""
-    
+    """在 HTML 中注入补丁脚本"""
     script_tag = f'<script>{INJECTION_SCRIPT}</script>'
-    
-    # 优先插入到 </head> 之前
+
     if '</head>' in html:
         return html.replace('</head>', script_tag + '\n</head>', 1)
-    
-    # 其次插入到 <body> 之后
+
     if '<body' in html:
-        # 找到第一个 > 后面插入
-        import re
         match = re.search(r'(<body[^>]*>)', html)
         if match:
             return html[:match.end()] + script_tag + '\n' + html[match.end():]
-    
-    # 最后兜底：插到 </html> 或文档末尾
+
     if '</html>' in html:
         return html.replace('</html>', script_tag + '\n</html>', 1)
-    
+
     return script_tag + '\n' + html
 
 
-def patch_get_button_response(body: str) -> str:
+def patch_get_button_response(body: bytes) -> bytes:
     """修补 getButton API 响应，扩展 result 列表"""
+    text = body.decode('utf-8')
     try:
-        data = json.loads(body)
+        data = json.loads(text)
         if isinstance(data, dict) and data.get('success') and isinstance(data.get('result'), list):
             original = data['result'].copy()
-            
-            # 合并去重，保持顺序
             merged = []
             for btn_id in FULL_BUTTON_RESULT:
                 if btn_id not in merged:
                     merged.append(btn_id)
-            
             data['result'] = merged
-            
-            logger.info(
-                f"📋 getButton 已修补: {json.dumps(original)} → {json.dumps(merged)}"
-            )
-            return json.dumps(data, ensure_ascii=False)
-        
-    except json.JSONDecodeError:
-        logger.warning("⚠️ getButton 响应不是有效 JSON")
-    
+            logger.info(f"📋 getButton 已修补: {json.dumps(original)} → {json.dumps(merged)}")
+            return json.dumps(data, ensure_ascii=False).encode('utf-8')
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning("⚠️ getButton 响应解析失败")
     return body
 
 
-def log_qr_code_response(body: str) -> None:
+def log_qr_code_response(body: bytes) -> bytes:
     """记录二维码 API 响应"""
+    text = body.decode('utf-8')
     try:
-        data = json.loads(body)
+        data = json.loads(text)
         if isinstance(data, dict) and data.get('success'):
             qr_data = data.get('message', '')
             logger.info(f"📷 截获签到二维码! base64 长度: {len(qr_data)} 字符")
         else:
-            logger.warning(f"⚠️ 二维码接口返回非成功状态: {data}")
-    except json.JSONDecodeError:
-        logger.warning("⚠️ 二维码响应不是有效 JSON")
+            logger.warning(f"⚠️ 二维码接口返回非成功状态")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning("⚠️ 二维码响应解析失败")
+    return body
+
+
+# ============================================================
+# 请求处理器
+# ============================================================
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    """反向代理请求处理器"""
+
+    # 抑制默认的日志输出（我们用自己的 logger）
+    def log_message(self, format, *args):
+        logger.info(f"{self.client_address[0]} - {format % args}")
+
+    def do_GET(self):
+        self._proxy_request()
+
+    def do_POST(self):
+        self._proxy_request()
+
+    def _proxy_request(self):
+        """核心代理逻辑：转发请求并选择性修改响应"""
+        
+        # 构建目标 URL
+        target_url = TARGET_BASE + self.path
+
+        # 准备转发头
+        forward_headers = {}
+        for key, value in self.headers.items():
+            if key.lower() in ('host', 'connection', 'transfer-encoding', 'content-length'):
+                continue
+            forward_headers[key] = value
+        forward_headers['Host'] = TARGET_HOST
+
+        # 读取请求体
+        body = None
+        if self.command == 'POST':
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                body = self.rfile.read(content_length)
+
+        try:
+            req = Request(target_url, data=body, headers=forward_headers, method=self.command)
+
+            with urlopen(req, timeout=30) as upstream_resp:
+                content_type = upstream_resp.headers.get('Content-Type', '')
+                status = upstream_resp.status
+
+                # ---- HTML 页面 → 注入补丁脚本 ----
+                if is_html_content(content_type):
+                    html_body = upstream_resp.read()
+                    modified_html = inject_script_into_html(
+                        html_body.decode('utf-8', errors='replace')
+                    )
+                    self._send_text(200, modified_html, 'text/html; charset=utf-8')
+                    return
+
+                # ---- getButton API → 扩展按钮列表 ----
+                if is_get_button_request(self.path):
+                    api_body = upstream_resp.read()
+                    modified_body = patch_get_button_response(api_body)
+                    ct = content_type or 'application/json; charset=utf-8'
+                    self._send_bytes(status, modified_body, ct)
+                    return
+
+                # ---- createWxaCodeUnlimit → 记录二维码 ----
+                if is_qr_code_request(self.path):
+                    api_body = upstream_resp.read()
+                    logged_body = log_qr_code_response(api_body)
+                    ct = content_type or 'application/json; charset=utf-8'
+                    self._send_bytes(status, logged_body, ct)
+                    return
+
+                # ---- 默认：原样转发 ----
+                resp_body = upstream_resp.read()
+
+                # 写入状态行
+                self.send_response(status)
+
+                # 复制响应头
+                skip_headers = {'transfer-encoding', 'content-encoding', 'content-length', 'connection'}
+                for key, value in upstream_resp.headers.items():
+                    if key.lower() not in skip_headers:
+                        self.send_header(key, value)
+                self.send_header('Content-Length', str(len(resp_body)))
+                self.end_headers()
+
+                self.wfile.write(resp_body)
+
+        except HTTPError as e:
+            logger.error(f"✗ HTTP 错误 {e.code}: {self.path}")
+            self._send_text(e.code, f"Proxy Error: HTTP {e.code}", 'text/plain')
+        except URLError as e:
+            logger.error(f"✗ 连接错误: {self.path} - {e.reason}")
+            self._send_text(502, f"Proxy Error: {str(e.reason)}", 'text/plain')
+        except Exception as e:
+            logger.error(f"✗ 代理异常: {self.path} - {e}")
+            import traceback
+            traceback.print_exc()
+            self._send_text(500, f"Proxy Error: {str(e)}", 'text/plain')
+
+    def _send_text(self, status: int, text: str, content_type: str):
+        """发送文本响应"""
+        encoded = text.encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_bytes(self, status: int, data: bytes, content_type: str):
+        """发送二进制响应"""
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """多线程 HTTP Server（支持并发请求）"""
+    daemon_threads = True
 
 
 # ============================================================
@@ -334,10 +348,7 @@ def log_qr_code_response(body: str) -> None:
 # ============================================================
 
 
-async def index_page(request: web.Request) -> web.Response:
-    """代理服务首页——使用说明和快捷链接"""
-
-    html = f"""<!DOCTYPE html>
+INDEX_HTML = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -363,7 +374,6 @@ h1 {{ color: #333; font-size: 22px; margin-bottom: 6px; }}
 .link:active {{ transform: scale(0.97); }}
 .info {{ background: #f5f5f5; border-radius: 10px; padding: 14px; font-size: 13px; color: #555;
        line-height: 1.6; }}
-.code {{ background: #263238; color: #80cbc4; padding: 2px 6px; border-radius: 4px; font-size: 12px; }}
 </style>
 </head>
 <body>
@@ -402,53 +412,117 @@ h1 {{ color: #333; font-size: 22px; margin-bottom: 6px; }}
 </div>
 </body>
 </html>"""
-    return web.Response(text=html, content_type='text/html; charset=utf-8')
+
+
+class IndexHandler(BaseHTTPRequestHandler):
+    """首页处理器"""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        body = INDEX_HTML.encode('utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass  # 静默首页日志
 
 
 # ============================================================
-# 应用创建
+# 启动入口
 # ============================================================
-
-
-def create_app(host: str = "0.0.0.0", port: int = 8899) -> web.Application:
-    """创建并配置代理应用"""
-
-    app = web.Application()
-    app.router.add_get('/', index_page)
-    app.router.add_route('*', '/{path:.*}', proxy_request)
-
-    logger.info("=" * 50)
-    logger.info("USTC Young 代理服务")
-    logger.info(f"监听地址: {host}:{port}")
-    logger.info(f"代理目标: {TARGET_HOST}")
-    logger.info("=" * 50)
-
-    return app
 
 
 def run(host: str = "0.0.0.0", port: int = 8899):
-    """启动代理服务（同步阻塞方式）"""
-    app = create_app(host, port)
-    web.run_app(app, host=host, port=port, print=None)
+    """启动代理服务"""
 
+    print()
+    print("=" * 50)
+    print("  🎓 USTC Young 代理服务")
+    print("=" * 50)
+    print(f"  监听地址: {host}:{port}")
+    print(f"  代理目标: {TARGET_HOST}")
+    print("=" * 50)
+    print()
+    print("  📱 手机使用:")
+    print(f"     1. 浏览器打开 http://<服务器IP>:{port}")
+    print("     2. 点击页面上的链接进入目标网站")
+    print("     3. 登录后签到按钮将自动显示")
+    print()
+    print("  按 Ctrl+C 停止服务")
+    print()
 
-async def run_async(host: str = "0.0.0.0", port: int = 8899):
-    """启动代理服务（异步方式，可与其他协程共存）"""
-    app = create_app(host, port)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host, port)
-    await site.start()
+    # 创建两个 server：一个处理首页，一个做代理
+    # 用 ThreadedHTTPServer 同时处理两者
+    
+    from functools import partial
+
+    class DualHandler(BaseHTTPRequestHandler):
+        """统一处理器：首页走 IndexHandler，其他走 ProxyHandler"""
+        
+        def __init__(self, *args, **kwargs):
+            BaseHTTPRequestHandler.__init__(self, *args, **kwargs)
+
+        def handle_one_request(self):
+            # 首页特殊处理
+            if self.path == '/' or self.path == '':
+                # 直接用 index handler 的逻辑
+                self.do_index()
+            else:
+                # 转发给 ProxyHandler
+                ProxyHandler.__init__(self, self.request, self.client_address, self.server)
+                ProxyHandler.handle_one_request(self)
+
+        def do_index(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            body = INDEX_HTML.encode('utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            logger.info(f"{self.client_address[0]} - {format % args}")
+
+    server = ThreadedHTTPServer((host, port), ProxyHandler)
+
+    # 特殊处理：重写根路径为首页
+    original_handle_one_request = ProxyHandler.handle_one_request
+
+    def patched_handle_one_request(self):
+        if hasattr(self, '_path_handled'):
+            del self._path_handled
+        if self.path in ('/', '', '/index.html'):
+            self._serve_index()
+        else:
+            original_handle_one_request(self)
+
+    def _serve_index(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        body = INDEX_HTML.encode('utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    ProxyHandler.handle_one_request = patched_handle_one_request
+    ProxyHandler._serve_index = _serve_index
+
     logger.info(f"✅ 代理服务已启动: http://{host}:{port}")
 
-    # 返回 runner 以便后续关闭
-    return runner
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n\n✅ 服务已停止")
+        server.shutdown()
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="USTC Young 前端覆写代理")
+    parser = argparse.ArgumentParser(description="USTC Young 前端覆写代理（纯标准库，零依赖）")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8899, help="监听端口 (默认 8899)")
     parser.add_argument("--debug", action="store_true", help="开启调试日志")

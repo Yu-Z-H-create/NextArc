@@ -122,6 +122,11 @@ class AuthSessionContext:
         """使用已登录的 YouthService 会话发起原始 HTTP 请求
         
         用于调用 pyustc 未封装的 API（如 createWxaCodeUnlimit）。
+        
+        核心发现：
+        - YouthService._client.cookies 为空！认证不靠 cookie
+        - 真正的认证凭证是 _client.headers 中的 x-access-token (JWT)
+        - 必须在请求中携带这个 token 才能通过服务端验证
         """
         base_url = "https://young.ustc.edu.cn"
         full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
@@ -129,112 +134,52 @@ class AuthSessionContext:
         logger.info(f"[RAW-REQUEST] {method} {full_url}")
         
         # ============================================================
-        # 深度探测 YouthService 对象的内部状态，找到所有可能的 cookie/认证信息
+        # 关键：从 YouthService._client.headers 提取 x-access-token (JWT)
         # ============================================================
-        all_cookies = {}
+        access_token = None
         
-        # --- 探测1: YouthService._client.cookies ---
         if self._service and hasattr(self._service, '_client') and self._service._client:
             try:
-                ys_cookies = dict(self._service._client.cookies)
-                logger.info(f"[RAW-REQUEST] YouthService._client.cookies: {list(ys_cookies.keys())}")
-                for k, v in ys_cookies.items():
-                    all_cookies[k] = str(v)
+                client_headers = dict(self._service._client.headers)
+                access_token = client_headers.get('x-access-token')
+                if access_token:
+                    logger.info(f"[RAW-REQUEST] ✅ 找到 x-access-token (长度={len(access_token)})")
+                else:
+                    logger.warning(f"[RAW-REQUEST] ⚠️ YouthService._client 无 x-access-token! headers keys: {list(client_headers.keys())}")
             except Exception as e:
-                logger.warning(f"[RAW-REQUEST] 读 YouthService._client.cookies 失败: {e}")
+                logger.error(f"[RAW-REQUEST] 读取 headers 失败: {e}")
         
-        # --- 探测2: CASClient cookies ---
+        if not access_token:
+            logger.error("[RAW-REQUEST] ❌ 无法获取 x-access-token，请求将失败!")
+        
+        # 合并自定义 headers，注入 x-access-token
+        merged_headers = kwargs.get('headers', {}).copy()
+        if access_token:
+            merged_headers['x-access-token'] = access_token
+            logger.info("[RAW-REQUEST] 已注入 x-access-token 到请求头")
+        
+        # 也收集 CAS cookies 作为补充
+        all_cookies = {}
         if self._cas_client:
             for cas_attr in ["_client", "client"]:
                 cas_c = getattr(self._cas_client, cas_attr, None)
                 if cas_c is not None and hasattr(cas_c, 'cookies'):
                     try:
-                        cas_cookies = dict(cas_c.cookies)
-                        logger.info(f"[RAW-REQUEST] CASClient.{cas_attr}.cookies: {list(cas_cookies.keys())}")
-                        for k, v in cas_cookies.items():
-                            if k not in all_cookies:
-                                all_cookies[k] = str(v)
-                    except Exception as e:
+                        for k, v in dict(cas_c.cookies).items():
+                            all_cookies[k] = str(v)
+                    except Exception:
                         pass
-        
-        # --- 探测3: 暴力枚举 YouthService 所有属性 ---
-        if self._service:
-            logger.info(f"[RAW-REQUEST] === 开始深度探测 YouthService 对象 ===")
-            for attr_name in dir(self._service):
-                if attr_name.startswith('_'):
-                    continue
-                try:
-                    val = getattr(self._service, attr_name, None)
-                    if val is not None:
-                        logger.info(f"[RAW-REQUEST]   YouthService.{attr_name} = {type(val).__name__}: {repr(val)[:100]}")
-                except:
-                    pass
-            
-            # 探测私有属性中的 httpx 相关对象
-            for attr_name in ['_client', 'client', '_session', 'session', '_http', 'http',
-                               '_req', 'request_obj', '_base_client', 'base_client']:
-                c = getattr(self._service, attr_name, None)
-                if c is not None:
-                    logger.info(f"[RAW-REQUEST]   探测 YouthService.{attr_name}: type={type(c).__name__}")
-                    # 检查是否有 cookies 属性
-                    if hasattr(c, 'cookies'):
-                        try:
-                            ck = dict(c.cookies)
-                            logger.info(f"[RAW-REQUEST]     .cookies = {ck}")
-                            for k, v in ck.items():
-                                if k not in all_cookies:
-                                    all_cookies[k] = str(v)
-                        except Exception as e:
-                            logger.info(f"[RAW-REQUEST]     .cookies 读取失败: {e}")
-                    # 检查是否有 headers 属性（可能有 Authorization 等）
-                    if hasattr(c, 'headers'):
-                        try:
-                            logger.info(f"[RAW-REQUEST]     .headers = {dict(c.headers)}")
-                        except:
-                            pass
-                    # 检查是否有 auth 属性
-                    if hasattr(c, 'auth'):
-                        try:
-                            logger.info(f"[RAW-REQUEST]     .auth = {c.auth}")
-                        except:
-                            pass
-                    # 检查 __dict__
-                    try:
-                        for sub_attr, sub_val in c.__dict__.items():
-                            if not sub_attr.startswith('__'):
-                                logger.info(f"[RAW-REQUEST]     .{sub_attr} = {type(sub_val).__name__}: {repr(sub_val)[:80]}")
-                    except:
-                        pass
-        
-        # --- 探测4: _service_obj (YouthService.__aenter__ 返回值) ---
-        if self._service_obj is not None:
-            logger.info(f"[RAW-REQUEST] === 探测 _service_obj (type={type(self._service_obj).__name__}) ===")
-            for attr_name in dir(self._service_obj):
-                if attr_name.startswith('_'):
-                    continue
-                try:
-                    val = getattr(self._service_obj, attr_name, None)
-                    if val is not None:
-                        logger.info(f"[RAW-REQUEST]   _service_obj.{attr_name} = {type(val).__name__}: {repr(val)[:100]}")
-                except:
-                    pass
-            # 检查 _service_obj 的私有属性中有没有 cookie/jar/session
-            for attr_name in ['_client', 'client', '_session', 'cookies', '_cookies', 
-                               'jar', '_jar', 'session_id', 'session_cookie', 'jsessionid']:
-                c = getattr(self._service_obj, attr_name, None)
-                if c is not None:
-                    logger.info(f"[RAW-REQUEST]   _service_obj.{attr_name} = {type(c).__name__}: {repr(c)[:150]}")
-        
-        logger.info(f"[RAW-REQUEST] 最终合并cookies: {list(all_cookies.keys())} (共{len(all_cookies)}个)")
         
         # ============================================================
-        # 创建独立的客户端，禁用自动重定向
+        # 创建独立客户端，手动控制重定向，携带 x-access-token
         # ============================================================
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0),
             follow_redirects=False,
             verify=True,
         )
+        
+        kwargs['headers'] = merged_headers
         
         try:
             return await self._do_raw_request_with_cookies(client, full_url, method.upper(), all_cookies, **kwargs)

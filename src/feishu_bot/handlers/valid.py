@@ -6,6 +6,7 @@ from pyustc.young import SecondClass, Status
 from src.core import EnrolledFilter, OverlayFilter, UserPreferenceManager
 from src.models import UserSession, secondclass_from_db_row
 from src.notifications import Response
+from src.utils.formatter import CardButtonConfig
 from src.utils.logger import get_logger
 from .base import CommandHandler
 

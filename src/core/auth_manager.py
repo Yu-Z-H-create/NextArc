@@ -123,9 +123,10 @@ class AuthSessionContext:
         
         用于调用 pyustc 未封装的 API（如 createWxaCodeUnlimit）。
         
-        策略：
-        1. 优先从 YouthService 实例获取已认证的客户端（base_url=young.ustc.edu.cn）
-        2. 若不可用，则创建新客户端 + 从已登录会话复制 cookie
+        核心策略：
+        - 完全绕过 YouthService 的内部客户端（它可能有 follow_redirects 等干扰行为）
+        - 创建独立的 AsyncClient，手动收集所有可用 cookie
+        - 手动控制重定向过程
         
         Args:
             method: HTTP 方法 ("GET", "POST", etc.)
@@ -138,113 +139,120 @@ class AuthSessionContext:
         Raises:
             RuntimeError: 如果尚未登录（未进入上下文管理器）
         """
-        import copy as _copy_module
-
         base_url = "https://young.ustc.edu.cn"
         full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
 
         logger.info(f"[RAW-REQUEST] {method} {full_url}")
         
         # ============================================================
-        # 策略 1：从 YouthService 获取客户端（正确的 base_url）
+        # 收集所有可用的 cookie（从多个来源）
         # ============================================================
-        client = None
-        client_source = None
+        all_cookies = {}
         
-        if self._service:
-            # 探测 YouthService 内部的 httpx 客户端属性
-            for attr_name in ["_client", "client", "session", "http_client", "_http", "_session"]:
-                c = getattr(self._service, attr_name, None)
-                if c is not None and hasattr(c, 'request'):
-                    client = c
-                    client_source = f"YouthService.{attr_name}"
-                    logger.info(f"[RAW-REQUEST] 找到客户端: {client_source}, type={type(c).__name__}, "
-                               f"base_url={getattr(c, 'base_url', 'N/A')}")
-                    break
+        # 来源1: YouthService._client 的 cookie jar
+        if self._service and hasattr(self._service, '_client') and self._service._client:
+            try:
+                ys_cookies = dict(self._service._client.cookies)
+                logger.info(f"[RAW-REQUEST] YouthService._client cookies: {list(ys_cookies.keys())}")
+                for k, v in ys_cookies.items():
+                    all_cookies[k] = str(v)
+            except Exception as e:
+                logger.warning(f"[RAW-REQUEST] 读取 YouthService._client cookies 失败: {e}")
+        
+        # 来源2: CASClient._client 的 cookie jar
+        if self._cas_client:
+            for cas_attr in ["_client", "client"]:
+                cas_c = getattr(self._cas_client, cas_attr, None)
+                if cas_c is not None and hasattr(cas_c, 'cookies'):
+                    try:
+                        cas_cookies = dict(cas_c.cookies)
+                        logger.info(f"[RAW-REQUEST] CASClient.{cas_attr} cookies: {list(cas_cookies.keys())}")
+                        for k, v in cas_cookies.items():
+                            if k not in all_cookies:  # 不覆盖 YouthService 的
+                                all_cookies[k] = str(v)
+                    except Exception as e:
+                        logger.warning(f"[RAW-REQUEST] 读取 CASClient.{cas_attr} cookies 失败: {e}")
+        
+        logger.info(f"[RAW-REQUEST] 最终合并cookies: {list(all_cookies.keys())} (共{len(all_cookies)}个)")
         
         # ============================================================
-        # 策略 2：如果 YouthService 没有可用的客户端，创建新的 + 复制 cookie
+        # 创建独立的、完全受控的 HTTP 客户端
+        # 关键：不使用 follow_redirects，我们自己处理重定向
         # ============================================================
-        if client is None:
-            logger.info("[RAW-REQUEST] YouthService 无可用客户端，尝试创建新客户端+复制cookie")
-            
-            # 收集所有可能的 cookie 来源
-            all_cookies = {}
-            
-            # 从 CASClient 的客户端收集 cookie（CAS 登录后的 cookie）
-            if self._cas_client:
-                for cas_attr in ["_client", "client"]:
-                    cas_c = getattr(self._cas_client, cas_attr, None)
-                    if cas_c is not None and hasattr(cas_c, 'cookies'):
-                        try:
-                            for name, value in dict(cas_c.cookies).items():
-                                if name not in all_cookies:
-                                    all_cookies[name] = str(value)
-                        except Exception:
-                            pass
-            
-            # 创建专门针对 young.ustc.edu.cn 的客户端
-            client = httpx.AsyncClient(
-                base_url=base_url,
-                timeout=httpx.Timeout(30.0),
-                follow_redirects=True,
-                cookies=all_cookies,
-            )
-            client_source = f"新建客户端(复制了{len(all_cookies)}个cookie)"
-            
-            logger.info(f"[RAW-REQUEST] {client_source}: cookies={list(all_cookies.keys()) if all_cookies else '(空)'}")
-            
-            # 使用完毕后需要关闭这个临时客户端
-            needs_close = True
-        else:
-            needs_close = False
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0),
+            follow_redirects=False,  # 禁用自动重定向！
+            verify=True,
+        )
         
         try:
-            return await self._do_raw_request(client, full_url, method.upper(), **kwargs)
+            return await self._do_raw_request_with_cookies(client, full_url, method.upper(), all_cookies, **kwargs)
         finally:
-            if needs_close:
-                await client.aclose()
+            await client.aclose()
 
-    async def _do_raw_request(self, client, full_url, method, **kwargs) -> httpx.Response:
-        """执行实际的原始请求，包含手动重定向处理"""
+    async def _do_raw_request_with_cookies(self, client, full_url, method, cookies, **kwargs) -> httpx.Response:
+        """使用指定 cookie 执行请求，手动处理重定向"""
         max_redirects = 5
-        response = await client.request(method, full_url, **kwargs)
         
-        logger.info(f"[RAW-REQUEST] 初始响应: status={response.status_code}, url={str(response.url)}")
-        logger.info(f"[RAW-REQUEST] 初始响应 headers: {dict(response.headers)}")
+        current_url = full_url
         
-        # 打印发送的请求信息
-        logger.info(f"[RAW-REQUEST] 实际请求URL: {full_url}, method={method}")
-        if 'headers' in kwargs:
-            logger.info(f"[RAW-REQUEST] 自定义headers: {kwargs['headers']}")
-        if 'json' in kwargs:
-            logger.info(f"[RAW-REQUEST] 请求body(json): {kwargs['json']}")
-        
-        for redirect_count in range(max_redirects):
+        for attempt in range(max_redirects + 1):
+            # 构建请求头（合并自定义 headers 和 cookie）
+            req_headers = kwargs.get('headers', {}).copy()
+            
+            logger.info(f"[RAW-REQUEST] === 请求 #{attempt+1}: {method} {current_url} ===")
+            logger.info(f"[RAW-REQUEST] Cookies: {cookies}")
+            if 'json' in kwargs:
+                logger.info(f"[RAW-REQUEST] Body: {kwargs['json']}")
+            
+            response = await client.request(
+                method, current_url,
+                json=kwargs.get('json'),
+                data=kwargs.get('data'),
+                headers=req_headers,
+                cookies=cookies,  # 显式传入 cookie
+            )
+            
+            logger.info(f"[RAW-REQUEST] 响应 #{attempt+1}: status={response.status_code}, url={str(response.url)}")
+            logger.info(f"[RAW-REQUEST] 响应 headers: {dict(response.headers)}")
+            
+            # 检查是否是重定向
             if response.status_code not in (301, 302, 303, 307, 308):
-                break
+                # 非重定向，更新 cookie（服务端可能通过 Set-Cookie 更新）并返回
+                new_cookies_from_response = dict(response.cookies)
+                if new_cookies_from_response:
+                    logger.info(f"[RAW-REQUEST] 响应 Set-Cookie: {new_cookies_from_response}")
+                return response
             
+            # 处理重定向
             location = response.headers.get("location", "")
-            logger.warning(f"[RAW-REQUEST] 重定向#{redirect_count + 1}: {response.status_code} → Location={location}")
-            
-            # 打印完整响应头帮助诊断
-            resp_headers = dict(response.headers)
-            logger.info(f"[RAW-REQUEST] 重定向#{redirect_count+1} 响应体前300字: {response.text[:300]}")
+            logger.warning(f"[RAW-REQUEST] 重定向! {response.status_code} → Location='{location}'")
+            logger.info(f"[RAW-REQUEST] 重定向响应体前200字: {response.text[:200]}")
             
             if not location:
-                logger.warning(f"[RAW-REQUEST] {response.status_code} 无 Location header (重定向#{redirect_count})")
-                break
+                logger.error("[RAW-REQUEST] 重定向无 Location header，终止")
+                return response
             
-            # 正确拼接绝对 URL
+            # 拼接绝对 URL
             if not location.startswith(("http://", "https://")):
                 from urllib.parse import urljoin
-                base_domain = full_url.split("/", 3)[0] + "//" + full_url.split("/", 2)[2]
-                location = urljoin(base_domain + "/", location)
+                parsed_base = current_url.rstrip("/")
+                location = urljoin(parsed_base + "/", location)
             
-            logger.info(f"[RAW-REQUEST] 重定向 #{redirect_count + 1}: {response.status_code} → {location}")
+            # 收集响应中的新 cookie
+            new_cookies = dict(response.cookies)
+            if new_cookies:
+                cookies.update({k: str(v) for k, v in new_cookies.items()})
+                logger.info(f"[RAW-REQUEST] 更新cookie后: {list(cookies.keys())}")
             
-            # 保留原始方法 POST + body（API 需要 body 数据）
-            response = await client.request(method, location, **kwargs)
+            current_url = location
+            
+            # 对于 303，方法必须改为 GET
+            if response.status_code == 303:
+                method = "GET"
+                # 移除 body 相关参数
+                kwargs.pop('json', None)
+                kwargs.pop('data', None)
         
-        logger.info(f"[RAW-REQUEST] 最终响应 status={response.status_code}, url={str(response.url)}")
+        logger.warning(f"[RAW-REQUEST] 达到最大重定向次数 ({max_redirects})")
         return response

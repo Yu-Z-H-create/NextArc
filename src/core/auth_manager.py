@@ -161,7 +161,7 @@ class AuthSessionContext:
         cookies_dict = dict(client.cookies)
         logger.info(f"[RAW-REQUEST] cookies(发送前): {list(cookies_dict.keys()) if cookies_dict else '(空)'}")
         
-        response = await client.request(method.upper(), full_url, **kwargs)
+        response = await client.request(method.upper(), full_url, follow_redirects=True, **kwargs)
         
-        logger.info(f"[RAW-REQUEST] 响应 status={response.status_code}, url={response.url}")
+        logger.info(f"[RAW-REQUEST] 响应 status={response.status_code}, url={response.url}, final_url={str(response.url)}")
         return response

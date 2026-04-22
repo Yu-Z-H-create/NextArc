@@ -510,7 +510,19 @@ class CardActionHandler:
                 logger.info(f"[QR-DEBUG]   status_code: {sign_in_resp.status_code}")
                 logger.info(f"[QR-DEBUG]   headers: {dict(sign_in_resp.headers)}")
                 resp_text = sign_in_resp.text
-                logger.info(f"[QR-DEBUG]   body(前500字): {resp_text[:500]}")
+                # 如果是 HTML 错误页，提取关键内容
+                if "text/html" in sign_in_resp.headers.get("content-type", ""):
+                    import re
+                    # 提取 <body> 或 <div> 中的文字
+                    body_match = re.search(r'<body[^>]*>(.*?)</body>', resp_text, re.DOTALL)
+                    if body_match:
+                        clean_text = re.sub(r'<[^>]+>', ' ', body_match.group(1))
+                        clean_text = ' '.join(clean_text.split())
+                        logger.info(f"[QR-DEBUG]   HTML body 文字: {clean_text[:500]}")
+                    else:
+                        logger.info(f"[QR-DEBUG]   body(前1000字): {resp_text[:1000]}")
+                else:
+                    logger.info(f"[QR-DEBUG]   body(前500字): {resp_text[:500]}")
                 logger.info(f"[QR-DEBUG]   body长度: {len(resp_text)}")
 
                 # 安全解析 JSON
@@ -537,7 +549,17 @@ class CardActionHandler:
                 logger.info(f"[QR-DEBUG]   status_code: {sign_out_resp.status_code}")
                 logger.info(f"[QR-DEBUG]   headers: {dict(sign_out_resp.headers)}")
                 out_resp_text = sign_out_resp.text
-                logger.info(f"[QR-DEBUG]   body(前500字): {out_resp_text[:500]}")
+                if "text/html" in sign_out_resp.headers.get("content-type", ""):
+                    import re
+                    body_match = re.search(r'<body[^>]*>(.*?)</body>', out_resp_text, re.DOTALL)
+                    if body_match:
+                        clean_text = re.sub(r'<[^>]+>', ' ', body_match.group(1))
+                        clean_text = ' '.join(clean_text.split())
+                        logger.info(f"[QR-DEBUG]   HTML body 文字: {clean_text[:500]}")
+                    else:
+                        logger.info(f"[QR-DEBUG]   body(前1000字): {out_resp_text[:1000]}")
+                else:
+                    logger.info(f"[QR-DEBUG]   body(前500字): {out_resp_text[:500]}")
                 logger.info(f"[QR-DEBUG]   body长度: {len(out_resp_text)}")
 
                 sign_out_data = {}

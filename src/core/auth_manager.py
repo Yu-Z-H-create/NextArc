@@ -179,20 +179,18 @@ class AuthSessionContext:
                 logger.warning(f"[RAW-REQUEST] {response.status_code} 无 Location header")
                 break
             
-            # 拼接绝对 URL
-            if location.startswith("/"):
+            # 正确拼接绝对 URL（修复路径重复 bug）
+            if not location.startswith(("http://", "https://")):
                 from urllib.parse import urljoin
-                location = urljoin(full_url + "/", location.lstrip("/"))
+                # location 是绝对路径（以/开头）或相对路径
+                # 用域名作为 base 来拼接，避免路径重复
+                base_domain = full_url.split("/", 3)[0] + "//" + full_url.split("/", 2)[2]
+                location = urljoin(base_domain + "/", location)
             
             logger.info(f"[RAW-REQUEST] 跟随重定向: {response.status_code} → {location}")
             
-            # 307/308 保留方法和 body；其他状态码按标准行为
-            if response.status_code in (307, 308):
-                response = await client.request(method.upper(), location, **kwargs)
-            else:
-                # 301/302/303 → GET（但我们要保留 POST body 因为这是 API）
-                # 青年网 API 实际上期望 POST 到重定向后的地址
-                response = await client.request("POST", location, **kwargs)
+            # 307/308 保留方法和 body；其他状态码也保留 POST（API 需要 body）
+            response = await client.request(method.upper(), location, **kwargs)
         
         logger.info(f"[RAW-REQUEST] 响应 status={response.status_code}, url={str(response.url)}")
         return response

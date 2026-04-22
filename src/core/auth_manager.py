@@ -210,11 +210,27 @@ class AuthSessionContext:
         max_redirects = 5
         response = await client.request(method, full_url, **kwargs)
         
+        logger.info(f"[RAW-REQUEST] 初始响应: status={response.status_code}, url={str(response.url)}")
+        logger.info(f"[RAW-REQUEST] 初始响应 headers: {dict(response.headers)}")
+        
+        # 打印发送的请求信息
+        logger.info(f"[RAW-REQUEST] 实际请求URL: {full_url}, method={method}")
+        if 'headers' in kwargs:
+            logger.info(f"[RAW-REQUEST] 自定义headers: {kwargs['headers']}")
+        if 'json' in kwargs:
+            logger.info(f"[RAW-REQUEST] 请求body(json): {kwargs['json']}")
+        
         for redirect_count in range(max_redirects):
             if response.status_code not in (301, 302, 303, 307, 308):
                 break
             
             location = response.headers.get("location", "")
+            logger.warning(f"[RAW-REQUEST] 重定向#{redirect_count + 1}: {response.status_code} → Location={location}")
+            
+            # 打印完整响应头帮助诊断
+            resp_headers = dict(response.headers)
+            logger.info(f"[RAW-REQUEST] 重定向#{redirect_count+1} 响应体前300字: {response.text[:300]}")
+            
             if not location:
                 logger.warning(f"[RAW-REQUEST] {response.status_code} 无 Location header (重定向#{redirect_count})")
                 break

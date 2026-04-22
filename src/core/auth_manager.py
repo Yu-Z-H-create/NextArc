@@ -44,10 +44,10 @@ class AuthSessionContext:
         self.password = password
         self.timeout = timeout
         self.retries = retries
-        self._client = None
-        self._service = None
-        self._client_obj = None
-        self._service_obj = None
+        self._cas_client = None       # CASClient 实例（持有已登录的 httpx client）
+        self._service = None          # YouthService 实例
+        self._cas_obj = None          # CASClient.__aenter__ 返回值
+        self._service_obj = None      # YouthService.__aenter__ 返回值
 
     async def _do_login(self):
         """执行登录，支持重试"""
@@ -55,11 +55,9 @@ class AuthSessionContext:
             try:
                 logger.debug(f"正在创建认证会话... (尝试 {attempt + 1}/{self.retries + 1}, 超时 {self.timeout}s)")
 
-                # CASClient.login_by_pwd 内部使用 httpx 默认超时
-                # 我们通过 asyncio.wait_for 从外部控制总超时
-                self._client = CASClient.login_by_pwd(self.username, self.password)
-                self._client_obj = await asyncio.wait_for(
-                    self._client.__aenter__(),
+                self._cas_client = CASClient.login_by_pwd(self.username, self.password)
+                self._cas_obj = await asyncio.wait_for(
+                    self._cas_client.__aenter__(),
                     timeout=self.timeout + 10.0,
                 )
 
@@ -69,7 +67,7 @@ class AuthSessionContext:
                     timeout=self.timeout,
                 )
                 await asyncio.wait_for(
-                    self._service_obj.login(self._client_obj),
+                    self._service_obj.login(self._cas_obj),
                     timeout=self.timeout,
                 )
 
@@ -80,10 +78,9 @@ class AuthSessionContext:
                     asyncio.TimeoutError) as e:
                 logger.warning(f"认证会话创建超时 (尝试 {attempt + 1}/{self.retries + 1}): {type(e).__name__}")
                 if attempt < self.retries:
-                    # 清理可能部分初始化的对象
                     await self._cleanup_partial()
                     import asyncio as aio
-                    await aio.sleep(1.0 * (attempt + 1))  # 递增退避
+                    await aio.sleep(1.0 * (attempt + 1))
                     continue
                 raise ConnectionError(
                     f"CAS 登录超时（已重试 {self.retries} 次，每次超时 {self.timeout}s）。"
@@ -103,14 +100,14 @@ class AuthSessionContext:
             finally:
                 self._service = None
                 self._service_obj = None
-        if self._client:
+        if self._cas_client:
             try:
-                await self._client.__aexit__(None, None, None)
+                await self._cas_client.__aexit__(None, None, None)
             except Exception:
                 pass
             finally:
-                self._client = None
-                self._client_obj = None
+                self._cas_client = None
+                self._cas_obj = None
 
     async def __aenter__(self):
         await self._do_login()
@@ -120,3 +117,29 @@ class AuthSessionContext:
         logger.debug("正在关闭认证会话...")
         await self._cleanup_partial()
         logger.debug("认证会话已关闭")
+
+    async def raw_request(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """使用已登录的 CAS session 发起原始 HTTP 请求
+        
+        用于调用 YouthService 未封装的 API（如 createWxaCodeUnlimit）。
+        
+        Args:
+            method: HTTP 方法 ("GET", "POST", etc.)
+            url: 完整 URL 或相对路径（相对路径自动拼接 young.ustc.edu.cn）
+            **kwargs: 传递给 httpx 的其他参数（json, data, headers 等）
+            
+        Returns:
+            httpx.Response
+            
+        Raises:
+            RuntimeError: 如果尚未登录（未进入上下文管理器）
+        """
+        if not self._cas_client or not hasattr(self._cas_client, "_client"):
+            raise RuntimeError("raw_request 需要先通过 async with 进入会话")
+
+        base_url = "https://young.ustc.edu.cn"
+        full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
+
+        client: httpx.AsyncClient = self._cas_client._client
+        response = await client.request(method.upper(), full_url, **kwargs)
+        return response

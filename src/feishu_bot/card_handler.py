@@ -480,11 +480,9 @@ class CardActionHandler:
         logger.info(f"获取二维码: {activity_name} ({activity_id})")
 
         try:
-            import httpx
             import base64
-            from pyustc import CASClient
+            import httpx
 
-            base_url = "https://young.ustc.edu.cn"
             qr_api_path = "/mobile/item/createWxaCodeUnlimit"
             qr_payload = {
                 "page": "pagesA/projectdt/projectdt",
@@ -492,147 +490,98 @@ class CardActionHandler:
                 "appId": "",
             }
 
-            # 通过 CASClient 登录获取认证会话，再用 httpx 调用 API
-            # （YouthService 不暴露 post/get 等 HTTP 方法，只能绕过它）
-            cas_client = CASClient.login_by_pwd(
-                self._auth_manager.username,
-                self._auth_manager.password,
-            )
-            cas_obj = await cas_client.__aenter__()
+            # 复用 auth_manager 已有的 CAS 登录流程，通过 raw_request 调用 API
+            session_ctx = self._auth_manager.create_session_once()
 
-            try:
-                sign_in_b64 = ""
-                sign_out_b64 = ""
+            async with session_ctx as service:
+                sign_in_resp = await session_ctx.raw_request(
+                    "POST", qr_api_path, json=qr_payload,
+                )
+                sign_in_data = sign_in_resp.json()
+                sign_in_b64 = sign_in_data.get("message") or "" if sign_in_data.get("success") else ""
 
-                # 用 httpx 携带 CAS 登录后的 cookie 请求青年网 API
-                # CASClient 登录后会设置全局 ContextVar cookie，但 httpx 无法直接使用
-                # 所以我们直接用 httpx 完成整个登录→请求流程
-                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-                    # 第一步：CAS 登录获取 TGT/cookie
-                    cas_login_url = "https://passport.ustc.edu.cn/cas/login"
-                    # 先访问 CAS 登录页获取 lt token
-                    cas_page = await client.get(cas_login_url)
-                    
-                    # 提取 execution 参数（CAS 5.x / 6.x）
-                    import re
-                    execution_match = re.search(r'name="execution"\s+value="([^"]+)"', cas_page.text)
-                    if not execution_match:
-                        return {
-                            "toast": {"type": "error", "content": "CAS 登录页面解析失败，无法获取 execution"}
-                        }
-                    execution = execution_match.group(1)
+                sign_out_resp = await session_ctx.raw_request(
+                    "POST", qr_api_path, json=qr_payload,
+                )
+                sign_out_data = sign_out_resp.json()
+                sign_out_b64 = sign_out_data.get("message") or "" if sign_out_data.get("success") else ""
 
-                    # 提交登录表单
-                    login_resp = await client.post(cas_login_url, data={
-                        "username": self._auth_manager.username,
-                        "password": self._auth_manager.password,
-                        "execution": execution,
-                        "_eventId": "submit",
-                    }, allow_redirects=True)
+                if not sign_in_data.get("success"):
+                    logger.warning(f"签到码API返回非成功: {sign_in_data}")
+                if not sign_out_data.get("success"):
+                    logger.warning(f"签退码API返回非成功: {sign_out_data}")
 
-                    # 第二步：访问青年网建立 session
-                    young_home = await client.get(base_url, allow_redirects=True)
-
-                    # 第三步：调用二维码 API（签到）
-                    sign_in_resp = await client.post(
-                        base_url + qr_api_path,
-                        json=qr_payload,
-                        headers={"Content-Type": "application/json"},
-                    )
-                    sign_in_data = sign_in_resp.json()
-                    if sign_in_data.get("success"):
-                        sign_in_b64 = sign_in_data.get("message") or ""
-                    else:
-                        logger.warning(f"签到码API返回非成功: {sign_in_data}")
-
-                    # 第四步：调用二维码 API（签退）—— 同一个 activity_id
-                    sign_out_resp = await client.post(
-                        base_url + qr_api_path,
-                        json=qr_payload,
-                        headers={"Content-Type": "application/json"},
-                    )
-                    sign_out_data = sign_out_resp.json()
-                    if sign_out_data.get("success"):
-                        sign_out_b64 = sign_out_data.get("message") or ""
-                    else:
-                        logger.warning(f"签退码API返回非成功: {sign_out_data}")
-
-                if not sign_in_b64 and not sign_out_b64:
-                    return {
-                        "toast": {"type": "error", "content": "二维码获取失败，请检查登录态或活动状态"}
-                    }
-
-                # 发送文字说明
-                msg_parts = [f"📋 {activity_name} 签到/签退二维码\n"]
-                if sign_in_b64:
-                    msg_parts.append("✅ **签到码**：见下方图片")
-                if sign_out_b64:
-                    msg_parts.append("⏪ **签退码**：见下方图片")
-
-                await self._bot.send_text("\n".join(msg_parts))
-
-                # 逐张发送图片
-                for label, b64_data in [("签到", sign_in_b64), ("签退", sign_out_b64)]:
-                    if not b64_data:
-                        continue
-
-                    try:
-                        img_bytes = base64.b64decode(b64_data)
-
-                        # 飞书图片上传
-                        token = await self._get_feishu_token()
-                        if not token:
-                            await self._bot.send_text(f"⚠️ {label}码: 无法上传图片")
-                            continue
-
-                        async with httpx.AsyncClient(timeout=15) as upload_client:
-                            files = {"image": ("qr.png", img_bytes, "image/png")}
-                            upload_resp = await upload_client.post(
-                                "https://open.feishu.cn/open-apis/im/v1/images",
-                                headers={"Authorization": f"Bearer {token}"},
-                                files=files,
-                            )
-                            upload_result = upload_resp.json()
-
-                        if upload_result.get("code") != 0:
-                            logger.warning(f"飞书图片上传失败: {upload_result.get('msg')}")
-                            await self._bot.send_text(f"⚠️ {label}码: 图片上传失败 - {upload_result.get('msg', '未知错误')}")
-                            continue
-
-                        image_key = upload_result["data"]["image_key"]
-
-                        # 发送图片消息
-                        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-                        from lark_oapi import Client
-
-                        lark_client = Client.builder() \
-                            .app_id(self._bot.app_id) \
-                            .app_secret(self._bot.app_secret) \
-                            .build()
-
-                        body = CreateMessageRequestBody.builder() \
-                            .receive_id(self._bot.get_chat_id()) \
-                            .msg_type("image") \
-                            .content(json.dumps({"image_key": image_key})) \
-                            .receive_id_type("chat_id") \
-                            .build()
-
-                        request = CreateMessageRequest.builder().request_body(body).build()
-                        response = lark_client.im.v1.message.create(request)
-
-                        if not response.success():
-                            logger.warning(f"发送{label}码图片失败: {response.msg}")
-
-                    except Exception as img_err:
-                        logger.error(f"处理{label}码图片异常: {img_err}")
-                        await self._bot.send_text(f"⚠️ {label}码: 处理失败 - {str(img_err)[:100]}")
-
+            if not sign_in_b64 and not sign_out_b64:
                 return {
-                    "toast": {"type": "success", "content": f"正在获取 {activity_name} 的二维码..."}
+                    "toast": {"type": "error", "content": "二维码获取失败，请检查登录态或活动状态"}
                 }
 
-            finally:
-                await cas_client.__aexit__(None, None, None)
+            # 发送文字说明
+            msg_parts = [f"📋 {activity_name} 签到/签退二维码\n"]
+            if sign_in_b64:
+                msg_parts.append("✅ **签到码**：见下方图片")
+            if sign_out_b64:
+                msg_parts.append("⏪ **签退码**：见下方图片")
+
+            await self._bot.send_text("\n".join(msg_parts))
+
+            # 逐张发送图片
+            for label, b64_data in [("签到", sign_in_b64), ("签退", sign_out_b64)]:
+                if not b64_data:
+                    continue
+
+                try:
+                    img_bytes = base64.b64decode(b64_data)
+
+                    token = await self._get_feishu_token()
+                    if not token:
+                        await self._bot.send_text(f"⚠️ {label}码: 无法上传图片")
+                        continue
+
+                    async with httpx.AsyncClient(timeout=15) as upload_client:
+                        files = {"image": ("qr.png", img_bytes, "image/png")}
+                        upload_resp = await upload_client.post(
+                            "https://open.feishu.cn/open-apis/im/v1/images",
+                            headers={"Authorization": f"Bearer {token}"},
+                            files=files,
+                        )
+                        upload_result = upload_resp.json()
+
+                    if upload_result.get("code") != 0:
+                        logger.warning(f"飞书图片上传失败: {upload_result.get('msg')}")
+                        await self._bot.send_text(f"⚠️ {label}码: 图片上传失败 - {upload_result.get('msg', '未知错误')}")
+                        continue
+
+                    image_key = upload_result["data"]["image_key"]
+
+                    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+                    from lark_oapi import Client
+
+                    lark_client = Client.builder() \
+                        .app_id(self._bot.app_id) \
+                        .app_secret(self._bot.app_secret) \
+                        .build()
+
+                    body = CreateMessageRequestBody.builder() \
+                        .receive_id(self._bot.get_chat_id()) \
+                        .msg_type("image") \
+                        .content(json.dumps({"image_key": image_key})) \
+                        .receive_id_type("chat_id") \
+                        .build()
+
+                    request = CreateMessageRequest.builder().request_body(body).build()
+                    response = lark_client.im.v1.message.create(request)
+
+                    if not response.success():
+                        logger.warning(f"发送{label}码图片失败: {response.msg}")
+
+                except Exception as img_err:
+                    logger.error(f"处理{label}码图片异常: {img_err}")
+                    await self._bot.send_text(f"⚠️ {label}码: 处理失败 - {str(img_err)[:100]}")
+
+            return {
+                "toast": {"type": "success", "content": f"正在获取 {activity_name} 的二维码..."}
+            }
 
         except Exception as e:
             logger.error(f"获取二维码失败: {e}")

@@ -58,7 +58,7 @@ class CardActionHandler:
             return await self._handle_view_children(activity_id, activity_name)
         elif action == "cancel":
             return await self._handle_cancel(activity_id, activity_name)
-        el        if action == "menu_cmd":
+        elif action == "menu_cmd":
             return await self._handle_menu_cmd(action_value)
         elif action == "get_qr":
             return await self._handle_get_qr(activity_id, activity_name)

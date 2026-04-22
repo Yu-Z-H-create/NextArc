@@ -119,9 +119,13 @@ class AuthSessionContext:
         logger.debug("认证会话已关闭")
 
     async def raw_request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """使用已登录的 CAS session 发起原始 HTTP 请求
+        """使用已登录的 YouthService 会话发起原始 HTTP 请求
         
-        用于调用 YouthService 未封装的 API（如 createWxaCodeUnlimit）。
+        用于调用 pyustc 未封装的 API（如 createWxaCodeUnlimit）。
+        
+        策略：
+        1. 优先从 YouthService 实例获取已认证的客户端（base_url=young.ustc.edu.cn）
+        2. 若不可用，则创建新客户端 + 从已登录会话复制 cookie
         
         Args:
             method: HTTP 方法 ("GET", "POST", etc.)
@@ -134,63 +138,97 @@ class AuthSessionContext:
         Raises:
             RuntimeError: 如果尚未登录（未进入上下文管理器）
         """
-        if not self._cas_client or not hasattr(self._cas_client, "_client"):
-            raise RuntimeError("raw_request 需要先通过 async with 进入会话")
+        import copy as _copy_module
 
         base_url = "https://young.ustc.edu.cn"
         full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
 
         logger.info(f"[RAW-REQUEST] {method} {full_url}")
         
-        # 探测 CASClient 内部的 httpx client 属性
-        cas = self._cas_client
-        client = getattr(cas, "_client", None)
-        if client is None:
-            # 尝试其他可能的属性名
-            for attr_name in ["client", "session", "http_client", "_http"]:
-                client = getattr(cas, attr_name, None)
-                if client is not None:
-                    logger.info(f"[RAW-REQUEST] 找到 httpx client 在属性: {attr_name}")
+        # ============================================================
+        # 策略 1：从 YouthService 获取客户端（正确的 base_url）
+        # ============================================================
+        client = None
+        client_source = None
+        
+        if self._service:
+            # 探测 YouthService 内部的 httpx 客户端属性
+            for attr_name in ["_client", "client", "session", "http_client", "_http", "_session"]:
+                c = getattr(self._service, attr_name, None)
+                if c is not None and hasattr(c, 'request'):
+                    client = c
+                    client_source = f"YouthService.{attr_name}"
+                    logger.info(f"[RAW-REQUEST] 找到客户端: {client_source}, type={type(c).__name__}, "
+                               f"base_url={getattr(c, 'base_url', 'N/A')}")
                     break
         
+        # ============================================================
+        # 策略 2：如果 YouthService 没有可用的客户端，创建新的 + 复制 cookie
+        # ============================================================
         if client is None:
-            logger.error(f"[RAW-ERROR] CASClient 上找不到 httpx client！可用属性: {[a for a in dir(cas) if not a.startswith('__')]}")
-            raise RuntimeError("无法从 CASClient 获取 httpx client")
+            logger.info("[RAW-REQUEST] YouthService 无可用客户端，尝试创建新客户端+复制cookie")
+            
+            # 收集所有可能的 cookie 来源
+            all_cookies = {}
+            
+            # 从 CASClient 的客户端收集 cookie（CAS 登录后的 cookie）
+            if self._cas_client:
+                for cas_attr in ["_client", "client"]:
+                    cas_c = getattr(self._cas_client, cas_attr, None)
+                    if cas_c is not None and hasattr(cas_c, 'cookies'):
+                        try:
+                            for name, value in dict(cas_c.cookies).items():
+                                if name not in all_cookies:
+                                    all_cookies[name] = str(value)
+                        except Exception:
+                            pass
+            
+            # 创建专门针对 young.ustc.edu.cn 的客户端
+            client = httpx.AsyncClient(
+                base_url=base_url,
+                timeout=httpx.Timeout(30.0),
+                follow_redirects=True,
+                cookies=all_cookies,
+            )
+            client_source = f"新建客户端(复制了{len(all_cookies)}个cookie)"
+            
+            logger.info(f"[RAW-REQUEST] {client_source}: cookies={list(all_cookies.keys()) if all_cookies else '(空)'}")
+            
+            # 使用完毕后需要关闭这个临时客户端
+            needs_close = True
+        else:
+            needs_close = False
         
-        logger.info(f"[RAW-REQUEST] client 类型: {type(client).__name__}, base_url: {getattr(client, 'base_url', 'N/A')}")
-        # 安全获取 cookies 列表（避免 CookieConflict 异常）
         try:
-            cookies_dict = dict(client.cookies)
-            logger.info(f"[RAW-REQUEST] cookies(发送前): {list(cookies_dict.keys()) if cookies_dict else '(空)'}")
-        except Exception as cookie_err:
-            logger.info(f"[RAW-REQUEST] cookies(发送前): (无法读取: {cookie_err})")
-        
-        # 手动处理重定向：httpx 对 POST 的 301/302 会变成 GET（丢失 body）
-        # 我们手动跟随，保留原始方法(method)和参数(kwargs)
+            return await self._do_raw_request(client, full_url, method.upper(), **kwargs)
+        finally:
+            if needs_close:
+                await client.aclose()
+
+    async def _do_raw_request(self, client, full_url, method, **kwargs) -> httpx.Response:
+        """执行实际的原始请求，包含手动重定向处理"""
         max_redirects = 5
-        response = await client.request(method.upper(), full_url, **kwargs)
+        response = await client.request(method, full_url, **kwargs)
         
-        for _ in range(max_redirects):
+        for redirect_count in range(max_redirects):
             if response.status_code not in (301, 302, 303, 307, 308):
                 break
             
             location = response.headers.get("location", "")
             if not location:
-                logger.warning(f"[RAW-REQUEST] {response.status_code} 无 Location header")
+                logger.warning(f"[RAW-REQUEST] {response.status_code} 无 Location header (重定向#{redirect_count})")
                 break
             
-            # 正确拼接绝对 URL（修复路径重复 bug）
+            # 正确拼接绝对 URL
             if not location.startswith(("http://", "https://")):
                 from urllib.parse import urljoin
-                # location 是绝对路径（以/开头）或相对路径
-                # 用域名作为 base 来拼接，避免路径重复
                 base_domain = full_url.split("/", 3)[0] + "//" + full_url.split("/", 2)[2]
                 location = urljoin(base_domain + "/", location)
             
-            logger.info(f"[RAW-REQUEST] 跟随重定向: {response.status_code} → {location}")
+            logger.info(f"[RAW-REQUEST] 重定向 #{redirect_count + 1}: {response.status_code} → {location}")
             
-            # 307/308 保留方法和 body；其他状态码也保留 POST（API 需要 body）
-            response = await client.request(method.upper(), location, **kwargs)
+            # 保留原始方法 POST + body（API 需要 body 数据）
+            response = await client.request(method, location, **kwargs)
         
-        logger.info(f"[RAW-REQUEST] 响应 status={response.status_code}, url={str(response.url)}")
+        logger.info(f"[RAW-REQUEST] 最终响应 status={response.status_code}, url={str(response.url)}")
         return response

@@ -490,18 +490,13 @@ class CardActionHandler:
                 "appId": "",
             }
 
-            logger.info(f"[QR-DEBUG] 开始获取二维码, activity_id={activity_id}, activity_name={activity_name}")
-            logger.info(f"[QR-DEBUG] API路径: {qr_api_path}")
-            logger.info(f"[QR-DEBUG] 请求参数: {qr_payload}")
+            logger.info(f"[QR] 请求 createWxaCodeUnlimit, scene={activity_id}")
 
             # 复用 auth_manager 已有的 CAS 登录流程，通过 raw_request 调用 API
             session_ctx = self._auth_manager.create_session_once()
 
             async with session_ctx as service:
-                # ===== 调试：检查 CAS 登录状态 =====
-                logger.info(f"[QR-DEBUG] CAS 登录成功, service 类型: {type(service).__name__}")
-
-                # 构造带完整浏览器 headers 的请求
+                # 构造带浏览器风格的 headers（模拟真实前端请求）
                 qr_headers = {
                     "Accept": "application/json, text/javascript, */*; q=0.01",
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -511,81 +506,32 @@ class CardActionHandler:
                     "Referer": f"https://young.ustc.edu.cn/mobile/item/projectdt?id={activity_id}",
                 }
 
-                # ===== 调试：签到码请求 =====
-                logger.info(f"[QR-DEBUG] >>> 发送签到码 POST 请求...")
-                logger.info(f"[QR-DEBUG] headers: {qr_headers}")
+                # ===== 签到码请求 =====
                 sign_in_resp = await session_ctx.raw_request(
                     "POST", qr_api_path, json=qr_payload, headers=qr_headers,
                 )
-                logger.info(f"[QR-DEBUG] <<< 签到码响应:")
-                logger.info(f"[QR-DEBUG]   status_code: {sign_in_resp.status_code}")
-                logger.info(f"[QR-DEBUG]   headers: {dict(sign_in_resp.headers)}")
-                resp_text = sign_in_resp.text
-                # 如果是 HTML 错误页，提取关键内容
-                if "text/html" in sign_in_resp.headers.get("content-type", ""):
-                    import re
-                    # 提取 <body> 或 <div> 中的文字
-                    body_match = re.search(r'<body[^>]*>(.*?)</body>', resp_text, re.DOTALL)
-                    if body_match:
-                        clean_text = re.sub(r'<[^>]+>', ' ', body_match.group(1))
-                        clean_text = ' '.join(clean_text.split())
-                        logger.info(f"[QR-DEBUG]   HTML body 文字: {clean_text[:500]}")
-                    else:
-                        logger.info(f"[QR-DEBUG]   body(前1000字): {resp_text[:1000]}")
-                else:
-                    logger.info(f"[QR-DEBUG]   body(前500字): {resp_text[:500]}")
-                logger.info(f"[QR-DEBUG]   body长度: {len(resp_text)}")
-
-                # 安全解析 JSON
-                sign_in_data = {}
-                try:
-                    sign_in_data = sign_in_resp.json()
-                    logger.info(f"[QR-DEBUG]   JSON 解析成功: {sign_in_data}")
-                except Exception as json_err:
-                    logger.error(f"[QR-DEBUG]   JSON 解析失败: {json_err}")
-
+                
+                # 解析响应：可能是 JSON 或 HTML 错误页
+                sign_in_data = self._parse_qr_response(sign_in_resp)
                 sign_in_b64 = ""
                 if isinstance(sign_in_data, dict) and sign_in_data.get("success"):
                     sign_in_b64 = sign_in_data.get("message") or ""
-                    logger.info(f"[QR-DEBUG]   签到码 base64 长度: {len(sign_in_b64)}")
+                    logger.info(f"[QR] 签到码获取成功 (base64长度: {len(sign_in_b64)})")
                 else:
-                    logger.warning(f"[QR-DEBUG] 签到码API返回非成功或非JSON: {sign_in_data}")
+                    logger.warning(f"[QR] 签到码API返回异常: status={sign_in_resp.status_code}, data={str(sign_in_data)[:200]}")
 
-                # ===== 调试：签退码请求（同一个 activity_id） =====
-                logger.info(f"[QR-DEBUG] >>> 发送签退码 POST 请求...")
+                # ===== 签退码请求（同一个 activity_id） =====
                 sign_out_resp = await session_ctx.raw_request(
                     "POST", qr_api_path, json=qr_payload, headers=qr_headers,
                 )
-                logger.info(f"[QR-DEBUG] <<< 签退码响应:")
-                logger.info(f"[QR-DEBUG]   status_code: {sign_out_resp.status_code}")
-                logger.info(f"[QR-DEBUG]   headers: {dict(sign_out_resp.headers)}")
-                out_resp_text = sign_out_resp.text
-                if "text/html" in sign_out_resp.headers.get("content-type", ""):
-                    import re
-                    body_match = re.search(r'<body[^>]*>(.*?)</body>', out_resp_text, re.DOTALL)
-                    if body_match:
-                        clean_text = re.sub(r'<[^>]+>', ' ', body_match.group(1))
-                        clean_text = ' '.join(clean_text.split())
-                        logger.info(f"[QR-DEBUG]   HTML body 文字: {clean_text[:500]}")
-                    else:
-                        logger.info(f"[QR-DEBUG]   body(前1000字): {out_resp_text[:1000]}")
-                else:
-                    logger.info(f"[QR-DEBUG]   body(前500字): {out_resp_text[:500]}")
-                logger.info(f"[QR-DEBUG]   body长度: {len(out_resp_text)}")
-
-                sign_out_data = {}
-                try:
-                    sign_out_data = sign_out_resp.json()
-                    logger.info(f"[QR-DEBUG]   JSON 解析成功: {sign_out_data}")
-                except Exception as json_err:
-                    logger.error(f"[QR-DEBUG]   JSON 解析失败: {json_err}")
-
+                
+                sign_out_data = self._parse_qr_response(sign_out_resp)
                 sign_out_b64 = ""
                 if isinstance(sign_out_data, dict) and sign_out_data.get("success"):
                     sign_out_b64 = sign_out_data.get("message") or ""
-                    logger.info(f"[QR-DEBUG]   签退码 base64 长度: {len(sign_out_b64)}")
+                    logger.info(f"[QR] 签退码获取成功 (base64长度: {len(sign_out_b64)})")
                 else:
-                    logger.warning(f"[QR-DEBUG] 签退码API返回非成功或非JSON: {sign_out_data}")
+                    logger.warning(f"[QR] 签退码API返回异常: status={sign_out_resp.status_code}, data={str(sign_out_data)[:200]}")
 
             if not sign_in_b64 and not sign_out_b64:
                 return {
@@ -694,6 +640,32 @@ class CardActionHandler:
             return {
                 "toast": {"type": "error", "content": toast_content}
             }
+
+    @staticmethod
+    def _parse_qr_response(resp) -> dict:
+        """解析 createWxaCodeUnlimit API 响应
+        
+        成功时返回: {"success": True, "message": "<base64>"}
+        失败时返回包含错误信息的 dict 或原始文本
+        """
+        content_type = resp.headers.get("content-type", "")
+        
+        if "text/html" in content_type.lower():
+            # HTML 错误页面：提取 <body> 中的文字信息
+            import re
+            text = resp.text
+            body_match = re.search(r'<body[^>]*>(.*?)</body>', text, re.DOTALL)
+            if body_match:
+                clean_text = re.sub(r'<[^>]+>', ' ', body_match.group(1))
+                clean_text = ' '.join(clean_text.split())
+                return {"success": False, "message": clean_text}
+            return {"success": False, "message": text[:500]}
+        
+        # 尝试 JSON 解析
+        try:
+            return resp.json()
+        except Exception:
+            return {"success": False, "message": f"非JSON响应 (HTTP {resp.status_code}): {resp.text[:200]}"}
 
     @staticmethod
     async def _get_feishu_token() -> str | None:

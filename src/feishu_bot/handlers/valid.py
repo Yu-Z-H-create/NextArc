@@ -234,6 +234,7 @@ class ValidHandler(CommandHandler):
                 hint="\n".join(lines),
                 ai_reasons=card_ai_reasons,
                 overlap_reasons=overlap_reasons if overlap_reasons else None,
+                button_config=CardButtonConfig(show_qr_button=True),  # 可报名活动也显示二维码按钮
             )
 
         except Exception as e:

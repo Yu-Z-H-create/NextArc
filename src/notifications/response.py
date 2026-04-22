@@ -79,7 +79,8 @@ class Response:
             show_ignore_button=False,
             show_join_button=False,
             show_cancel_button=True,
-            show_children_button=True
+            show_children_button=True,
+            show_qr_button=True,  # 已报名活动显示查看二维码按钮
         )
 
         return cls.activity_list(

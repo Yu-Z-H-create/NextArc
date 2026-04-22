@@ -65,7 +65,8 @@ class SearchHandler(CommandHandler):
                 show_ignore_button=True,
                 show_interested_button=True,
                 show_join_button=True,
-                show_children_button=True
+                show_children_button=True,
+                show_qr_button=True  # 搜索结果也显示二维码按钮
             )
             
             return Response.activity_list(

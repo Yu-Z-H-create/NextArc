@@ -30,6 +30,7 @@ class CardButtonConfig:
     show_join_button: bool = True
     show_cancel_button: bool = False
     show_children_button: bool = True
+    show_qr_button: bool = False  # 是否显示「查看二维码」按钮
     is_ignored: bool = False
 
     def get_buttons(self, act: SecondClass) -> list[dict]:
@@ -69,6 +70,19 @@ class CardButtonConfig:
                 "type": "danger",
                 "value": {
                     "action": "cancel",
+                    "activity_id": act.id,
+                    "activity_name": act.name
+                }
+            })
+
+        # 「查看二维码」按钮（签到+签退）
+        if self.show_qr_button:
+            buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "查看二维码"},
+                "type": "primary",
+                "value": {
+                    "action": "get_qr",
                     "activity_id": act.id,
                     "activity_name": act.name
                 }

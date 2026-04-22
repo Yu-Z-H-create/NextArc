@@ -86,7 +86,8 @@ class NotificationListener:
                     show_ignore_button=True,
                     show_interested_button=True,
                     show_join_button=True,
-                    show_children_button=True
+                    show_children_button=True,
+                    show_qr_button=True  # 新活动通知也显示二维码按钮
                 )
 
                 await self._notification_service.send_activity_list_card(

@@ -1,5 +1,6 @@
 """卡片交互处理器"""
 
+import json
 import traceback
 from typing import TYPE_CHECKING, Optional
 
@@ -57,8 +58,10 @@ class CardActionHandler:
             return await self._handle_view_children(activity_id, activity_name)
         elif action == "cancel":
             return await self._handle_cancel(activity_id, activity_name)
-        elif action == "menu_cmd":
+        el        if action == "menu_cmd":
             return await self._handle_menu_cmd(action_value)
+        elif action == "get_qr":
+            return await self._handle_get_qr(activity_id, activity_name)
         else:
             return {
                 "toast": {
@@ -466,6 +469,169 @@ class CardActionHandler:
                     "content": f"取消报名失败: {str(e)[:50]}"
                 }
             }
+
+    async def _handle_get_qr(self, activity_id: str, activity_name: str) -> dict:
+        """获取活动的签到+签退二维码，通过飞书消息返回"""
+        if not self._auth_manager or not self._bot:
+            return {
+                "toast": {"type": "error", "content": "服务未初始化，请稍后重试"}
+            }
+
+        logger.info(f"获取二维码: {activity_name} ({activity_id})")
+
+        try:
+            import httpx
+
+            async with self._auth_manager.create_session_once() as service:
+                # 调用 createWxaCodeUnlimit API（签到）
+                sign_in_resp = await service.post(
+                    "/mobile/item/createWxaCodeUnlimit",
+                    json={
+                        "page": "pagesA/projectdt/projectdt",
+                        "scene": str(activity_id),
+                        "appId": "",
+                    }
+                )
+                # 调用 createWxaCodeUnlimit API（签退）
+                sign_out_resp = await service.post(
+                    "/mobile/item/createWxaCodeUnlimit",
+                    json={
+                        "page": "pagesA/projectdt/projectdt",
+                        "scene": str(activity_id),
+                        "appId": "",
+                    }
+                )
+
+                sign_in_data = sign_in_resp.json() if hasattr(sign_in_resp, 'json') else {}
+                sign_out_data = sign_out_resp.json() if hasattr(sign_out_resp, 'json') else {}
+
+                sign_in_b64 = (sign_in_data.get("message") or "") if sign_in_data.get("success") else ""
+                sign_out_b64 = (sign_out_data.get("message") or "") if sign_out_data.get("success") else ""
+
+                if not sign_in_b64 and not sign_out_b64:
+                    return {
+                        "toast": {"type": "error", "content": "二维码获取失败，请检查登录态或活动状态"}
+                    }
+
+                # 通过飞书发送包含两张二维码图片的消息
+                msg_parts = [f"📋 {activity_name} 签到/签退二维码\n"]
+                
+                if sign_in_b64:
+                    msg_parts.append("✅ **签到码**：见下方图片")
+                if sign_out_b64:
+                    msg_parts.append("⏪ **签退码**：见下方图片")
+                if sign_in_b64:
+                    msg_parts.append("\n---签到码---")
+                if sign_out_b64:
+                    msg_parts.append("\n---签退码---")
+
+                # 发送文字说明
+                await self._bot.send_text("\n".join(msg_parts))
+
+                # 逐张发送图片（base64 → 飞书图片上传 → 发送图片消息）
+                for label, b64_data in [("签到", sign_in_b64), ("签退", sign_out_b64)]:
+                    if not b64_data:
+                        continue
+
+                    try:
+                        import base64
+                        img_bytes = base64.b64decode(b64_data)
+                        
+                        # 上传到飞书图片服务
+                        token = await self._get_feishu_token()
+                        if not token:
+                            await self._bot.send_text(f"⚠️ {label}码: 无法上传图片（token获取失败）")
+                            continue
+
+                        upload_url = f"https://open.feishu.cn/open-apis/im/v1/images"
+                        headers = {
+                            "Authorization": f"Bearer {token}",
+                        }
+
+                        async with httpx.AsyncClient(timeout=15) as client:
+                            files = {"image": ("qr.png", img_bytes, "image/png")}
+                            upload_resp = await client.post(upload_url, headers=headers, files=files)
+                            upload_result = upload_resp.json()
+
+                        if upload_result.get("code") != 0:
+                            logger.warning(f"飞书图片上传失败: {upload_result.get('msg')}")
+                            await self._bot.send_text(f"⚠️ {label}码: 图片上传失败 - {upload_result.get('msg', '未知错误')}")
+                            continue
+
+                        image_key = upload_result["data"]["image_key"]
+
+                        # 发送图片消息
+                        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+                        from lark_oapi import Client
+
+                        client_obj = Client.builder() \
+                            .app_id(self._bot.app_id) \
+                            .app_secret(self._bot.app_secret) \
+                            .build()
+
+                        body = CreateMessageRequestBody.builder() \
+                            .receive_id(self._bot.get_chat_id()) \
+                            .msg_type("image") \
+                            .content(json.dumps({"image_key": image_key})) \
+                            .receive_id_type("chat_id") \
+                            .build()
+
+                        request = CreateMessageRequest.builder().request_body(body).build()
+                        response = client_obj.im.v1.message.create(request)
+
+                        if not response.success():
+                            logger.warning(f"发送{label}码图片失败: {response.msg}")
+
+                    except Exception as img_err:
+                        logger.error(f"处理{label}码图片异常: {img_err}")
+                        await self._bot.send_text(f"⚠️ {label}码: 处理失败 - {str(img_err)[:100]}")
+
+                return {
+                    "toast": {"type": "success", "content": f"正在获取 {activity_name} 的二维码..."}
+                }
+
+        except Exception as e:
+            logger.error(f"获取二维码失败: {e}")
+            import traceback
+            traceback.print_exc()
+            error_msg = (
+                f"二维码获取失败\n\n"
+                f"活动：{activity_name}\n"
+                f"错误：{str(e)}"
+            )
+            try:
+                await self._bot.send_text(error_msg)
+            except Exception:
+                pass
+
+            return {
+                "toast": {"type": "error", "content": f"获取失败: {str(e)[:50]}"}
+            }
+
+    @staticmethod
+    async def _get_feishu_token() -> str | None:
+        """获取飞书 tenant_access_token"""
+        try:
+            import httpx
+            url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+            # 使用 bot 的凭证（通过 card_handler 拿不到 bot 实例时需要其他方式）
+            # 这里从 settings 读取
+            from src.config import get_settings
+            settings = get_settings()
+            payload = {"app_id": settings.feishu.app_id, "app_secret": settings.feishu.app_secret}
+
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(url, json=payload)
+                result = resp.json()
+
+            if result.get("code") == 0:
+                return result.get("tenant_access_token")
+
+            logger.error(f"获取 tenant_access_token 失败: {result.get('msg')}")
+            return None
+        except Exception as e:
+            logger.error(f"获取飞书 token 异常: {e}")
+            return None
 
     async def _handle_menu_cmd(self, action_value: dict) -> dict:
         """将菜单按钮转回现有文本指令入口。"""

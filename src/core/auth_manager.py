@@ -122,22 +122,6 @@ class AuthSessionContext:
         """使用已登录的 YouthService 会话发起原始 HTTP 请求
         
         用于调用 pyustc 未封装的 API（如 createWxaCodeUnlimit）。
-        
-        核心策略：
-        - 完全绕过 YouthService 的内部客户端（它可能有 follow_redirects 等干扰行为）
-        - 创建独立的 AsyncClient，手动收集所有可用 cookie
-        - 手动控制重定向过程
-        
-        Args:
-            method: HTTP 方法 ("GET", "POST", etc.)
-            url: 完整 URL 或相对路径（相对路径自动拼接 young.ustc.edu.cn）
-            **kwargs: 传递给 httpx 的其他参数（json, data, headers 等）
-            
-        Returns:
-            httpx.Response
-            
-        Raises:
-            RuntimeError: 如果尚未登录（未进入上下文管理器）
         """
         base_url = "https://young.ustc.edu.cn"
         full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
@@ -145,43 +129,110 @@ class AuthSessionContext:
         logger.info(f"[RAW-REQUEST] {method} {full_url}")
         
         # ============================================================
-        # 收集所有可用的 cookie（从多个来源）
+        # 深度探测 YouthService 对象的内部状态，找到所有可能的 cookie/认证信息
         # ============================================================
         all_cookies = {}
         
-        # 来源1: YouthService._client 的 cookie jar
+        # --- 探测1: YouthService._client.cookies ---
         if self._service and hasattr(self._service, '_client') and self._service._client:
             try:
                 ys_cookies = dict(self._service._client.cookies)
-                logger.info(f"[RAW-REQUEST] YouthService._client cookies: {list(ys_cookies.keys())}")
+                logger.info(f"[RAW-REQUEST] YouthService._client.cookies: {list(ys_cookies.keys())}")
                 for k, v in ys_cookies.items():
                     all_cookies[k] = str(v)
             except Exception as e:
-                logger.warning(f"[RAW-REQUEST] 读取 YouthService._client cookies 失败: {e}")
+                logger.warning(f"[RAW-REQUEST] 读 YouthService._client.cookies 失败: {e}")
         
-        # 来源2: CASClient._client 的 cookie jar
+        # --- 探测2: CASClient cookies ---
         if self._cas_client:
             for cas_attr in ["_client", "client"]:
                 cas_c = getattr(self._cas_client, cas_attr, None)
                 if cas_c is not None and hasattr(cas_c, 'cookies'):
                     try:
                         cas_cookies = dict(cas_c.cookies)
-                        logger.info(f"[RAW-REQUEST] CASClient.{cas_attr} cookies: {list(cas_cookies.keys())}")
+                        logger.info(f"[RAW-REQUEST] CASClient.{cas_attr}.cookies: {list(cas_cookies.keys())}")
                         for k, v in cas_cookies.items():
-                            if k not in all_cookies:  # 不覆盖 YouthService 的
+                            if k not in all_cookies:
                                 all_cookies[k] = str(v)
                     except Exception as e:
-                        logger.warning(f"[RAW-REQUEST] 读取 CASClient.{cas_attr} cookies 失败: {e}")
+                        pass
+        
+        # --- 探测3: 暴力枚举 YouthService 所有属性 ---
+        if self._service:
+            logger.info(f"[RAW-REQUEST] === 开始深度探测 YouthService 对象 ===")
+            for attr_name in dir(self._service):
+                if attr_name.startswith('_'):
+                    continue
+                try:
+                    val = getattr(self._service, attr_name, None)
+                    if val is not None:
+                        logger.info(f"[RAW-REQUEST]   YouthService.{attr_name} = {type(val).__name__}: {repr(val)[:100]}")
+                except:
+                    pass
+            
+            # 探测私有属性中的 httpx 相关对象
+            for attr_name in ['_client', 'client', '_session', 'session', '_http', 'http',
+                               '_req', 'request_obj', '_base_client', 'base_client']:
+                c = getattr(self._service, attr_name, None)
+                if c is not None:
+                    logger.info(f"[RAW-REQUEST]   探测 YouthService.{attr_name}: type={type(c).__name__}")
+                    # 检查是否有 cookies 属性
+                    if hasattr(c, 'cookies'):
+                        try:
+                            ck = dict(c.cookies)
+                            logger.info(f"[RAW-REQUEST]     .cookies = {ck}")
+                            for k, v in ck.items():
+                                if k not in all_cookies:
+                                    all_cookies[k] = str(v)
+                        except Exception as e:
+                            logger.info(f"[RAW-REQUEST]     .cookies 读取失败: {e}")
+                    # 检查是否有 headers 属性（可能有 Authorization 等）
+                    if hasattr(c, 'headers'):
+                        try:
+                            logger.info(f"[RAW-REQUEST]     .headers = {dict(c.headers)}")
+                        except:
+                            pass
+                    # 检查是否有 auth 属性
+                    if hasattr(c, 'auth'):
+                        try:
+                            logger.info(f"[RAW-REQUEST]     .auth = {c.auth}")
+                        except:
+                            pass
+                    # 检查 __dict__
+                    try:
+                        for sub_attr, sub_val in c.__dict__.items():
+                            if not sub_attr.startswith('__'):
+                                logger.info(f"[RAW-REQUEST]     .{sub_attr} = {type(sub_val).__name__}: {repr(sub_val)[:80]}")
+                    except:
+                        pass
+        
+        # --- 探测4: _service_obj (YouthService.__aenter__ 返回值) ---
+        if self._service_obj is not None:
+            logger.info(f"[RAW-REQUEST] === 探测 _service_obj (type={type(self._service_obj).__name__}) ===")
+            for attr_name in dir(self._service_obj):
+                if attr_name.startswith('_'):
+                    continue
+                try:
+                    val = getattr(self._service_obj, attr_name, None)
+                    if val is not None:
+                        logger.info(f"[RAW-REQUEST]   _service_obj.{attr_name} = {type(val).__name__}: {repr(val)[:100]}")
+                except:
+                    pass
+            # 检查 _service_obj 的私有属性中有没有 cookie/jar/session
+            for attr_name in ['_client', 'client', '_session', 'cookies', '_cookies', 
+                               'jar', '_jar', 'session_id', 'session_cookie', 'jsessionid']:
+                c = getattr(self._service_obj, attr_name, None)
+                if c is not None:
+                    logger.info(f"[RAW-REQUEST]   _service_obj.{attr_name} = {type(c).__name__}: {repr(c)[:150]}")
         
         logger.info(f"[RAW-REQUEST] 最终合并cookies: {list(all_cookies.keys())} (共{len(all_cookies)}个)")
         
         # ============================================================
-        # 创建独立的、完全受控的 HTTP 客户端
-        # 关键：不使用 follow_redirects，我们自己处理重定向
+        # 创建独立的客户端，禁用自动重定向
         # ============================================================
         client = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0),
-            follow_redirects=False,  # 禁用自动重定向！
+            follow_redirects=False,
             verify=True,
         )
         
@@ -193,15 +244,13 @@ class AuthSessionContext:
     async def _do_raw_request_with_cookies(self, client, full_url, method, cookies, **kwargs) -> httpx.Response:
         """使用指定 cookie 执行请求，手动处理重定向"""
         max_redirects = 5
-        
         current_url = full_url
         
         for attempt in range(max_redirects + 1):
-            # 构建请求头（合并自定义 headers 和 cookie）
             req_headers = kwargs.get('headers', {}).copy()
             
             logger.info(f"[RAW-REQUEST] === 请求 #{attempt+1}: {method} {current_url} ===")
-            logger.info(f"[RAW-REQUEST] Cookies: {cookies}")
+            logger.info(f"[RAW-REQUEST] Cookies: {list(cookies.keys())}")
             if 'json' in kwargs:
                 logger.info(f"[RAW-REQUEST] Body: {kwargs['json']}")
             
@@ -210,49 +259,37 @@ class AuthSessionContext:
                 json=kwargs.get('json'),
                 data=kwargs.get('data'),
                 headers=req_headers,
-                cookies=cookies,  # 显式传入 cookie
+                cookies=cookies,
             )
             
             logger.info(f"[RAW-REQUEST] 响应 #{attempt+1}: status={response.status_code}, url={str(response.url)}")
-            logger.info(f"[RAW-REQUEST] 响应 headers: {dict(response.headers)}")
             
-            # 检查是否是重定向
             if response.status_code not in (301, 302, 303, 307, 308):
-                # 非重定向，更新 cookie（服务端可能通过 Set-Cookie 更新）并返回
                 new_cookies_from_response = dict(response.cookies)
                 if new_cookies_from_response:
                     logger.info(f"[RAW-REQUEST] 响应 Set-Cookie: {new_cookies_from_response}")
                 return response
             
-            # 处理重定向
             location = response.headers.get("location", "")
-            logger.warning(f"[RAW-REQUEST] 重定向! {response.status_code} → Location='{location}'")
-            logger.info(f"[RAW-REQUEST] 重定向响应体前200字: {response.text[:200]}")
+            logger.warning(f"[RAW-REQUEST] 重定向! {response.status_code} → '{location}'")
+            logger.info(f"[RAW-REQUEST] 重定向体: {response.text[:200]}")
             
             if not location:
-                logger.error("[RAW-REQUEST] 重定向无 Location header，终止")
                 return response
             
-            # 拼接绝对 URL
             if not location.startswith(("http://", "https://")):
                 from urllib.parse import urljoin
-                parsed_base = current_url.rstrip("/")
-                location = urljoin(parsed_base + "/", location)
+                location = urljoin(current_url.rstrip("/") + "/", location)
             
-            # 收集响应中的新 cookie
             new_cookies = dict(response.cookies)
             if new_cookies:
                 cookies.update({k: str(v) for k, v in new_cookies.items()})
-                logger.info(f"[RAW-REQUEST] 更新cookie后: {list(cookies.keys())}")
             
             current_url = location
             
-            # 对于 303，方法必须改为 GET
             if response.status_code == 303:
                 method = "GET"
-                # 移除 body 相关参数
                 kwargs.pop('json', None)
                 kwargs.pop('data', None)
         
-        logger.warning(f"[RAW-REQUEST] 达到最大重定向次数 ({max_redirects})")
         return response

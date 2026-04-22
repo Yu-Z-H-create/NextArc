@@ -490,26 +490,69 @@ class CardActionHandler:
                 "appId": "",
             }
 
+            logger.info(f"[QR-DEBUG] 开始获取二维码, activity_id={activity_id}, activity_name={activity_name}")
+            logger.info(f"[QR-DEBUG] API路径: {qr_api_path}")
+            logger.info(f"[QR-DEBUG] 请求参数: {qr_payload}")
+
             # 复用 auth_manager 已有的 CAS 登录流程，通过 raw_request 调用 API
             session_ctx = self._auth_manager.create_session_once()
 
             async with session_ctx as service:
+                # ===== 调试：检查 CAS 登录状态 =====
+                logger.info(f"[QR-DEBUG] CAS 登录成功, service 类型: {type(service).__name__}")
+
+                # ===== 调试：签到码请求 =====
+                logger.info(f"[QR-DEBUG] >>> 发送签到码 POST 请求...")
                 sign_in_resp = await session_ctx.raw_request(
                     "POST", qr_api_path, json=qr_payload,
                 )
-                sign_in_data = sign_in_resp.json()
-                sign_in_b64 = sign_in_data.get("message") or "" if sign_in_data.get("success") else ""
+                logger.info(f"[QR-DEBUG] <<< 签到码响应:")
+                logger.info(f"[QR-DEBUG]   status_code: {sign_in_resp.status_code}")
+                logger.info(f"[QR-DEBUG]   headers: {dict(sign_in_resp.headers)}")
+                resp_text = sign_in_resp.text
+                logger.info(f"[QR-DEBUG]   body(前500字): {resp_text[:500]}")
+                logger.info(f"[QR-DEBUG]   body长度: {len(resp_text)}")
 
+                # 安全解析 JSON
+                sign_in_data = {}
+                try:
+                    sign_in_data = sign_in_resp.json()
+                    logger.info(f"[QR-DEBUG]   JSON 解析成功: {sign_in_data}")
+                except Exception as json_err:
+                    logger.error(f"[QR-DEBUG]   JSON 解析失败: {json_err}")
+
+                sign_in_b64 = ""
+                if isinstance(sign_in_data, dict) and sign_in_data.get("success"):
+                    sign_in_b64 = sign_in_data.get("message") or ""
+                    logger.info(f"[QR-DEBUG]   签到码 base64 长度: {len(sign_in_b64)}")
+                else:
+                    logger.warning(f"[QR-DEBUG] 签到码API返回非成功或非JSON: {sign_in_data}")
+
+                # ===== 调试：签退码请求（同一个 activity_id） =====
+                logger.info(f"[QR-DEBUG] >>> 发送签退码 POST 请求...")
                 sign_out_resp = await session_ctx.raw_request(
                     "POST", qr_api_path, json=qr_payload,
                 )
-                sign_out_data = sign_out_resp.json()
-                sign_out_b64 = sign_out_data.get("message") or "" if sign_out_data.get("success") else ""
+                logger.info(f"[QR-DEBUG] <<< 签退码响应:")
+                logger.info(f"[QR-DEBUG]   status_code: {sign_out_resp.status_code}")
+                logger.info(f"[QR-DEBUG]   headers: {dict(sign_out_resp.headers)}")
+                out_resp_text = sign_out_resp.text
+                logger.info(f"[QR-DEBUG]   body(前500字): {out_resp_text[:500]}")
+                logger.info(f"[QR-DEBUG]   body长度: {len(out_resp_text)}")
 
-                if not sign_in_data.get("success"):
-                    logger.warning(f"签到码API返回非成功: {sign_in_data}")
-                if not sign_out_data.get("success"):
-                    logger.warning(f"签退码API返回非成功: {sign_out_data}")
+                sign_out_data = {}
+                try:
+                    sign_out_data = sign_out_resp.json()
+                    logger.info(f"[QR-DEBUG]   JSON 解析成功: {sign_out_data}")
+                except Exception as json_err:
+                    logger.error(f"[QR-DEBUG]   JSON 解析失败: {json_err}")
+
+                sign_out_b64 = ""
+                if isinstance(sign_out_data, dict) and sign_out_data.get("success"):
+                    sign_out_b64 = sign_out_data.get("message") or ""
+                    logger.info(f"[QR-DEBUG]   签退码 base64 长度: {len(sign_out_b64)}")
+                else:
+                    logger.warning(f"[QR-DEBUG] 签退码API返回非成功或非JSON: {sign_out_data}")
 
             if not sign_in_b64 and not sign_out_b64:
                 return {

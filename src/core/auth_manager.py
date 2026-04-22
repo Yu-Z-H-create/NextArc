@@ -140,6 +140,28 @@ class AuthSessionContext:
         base_url = "https://young.ustc.edu.cn"
         full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
 
-        client: httpx.AsyncClient = self._cas_client._client
+        logger.info(f"[RAW-REQUEST] {method} {full_url}")
+        
+        # 探测 CASClient 内部的 httpx client 属性
+        cas = self._cas_client
+        client = getattr(cas, "_client", None)
+        if client is None:
+            # 尝试其他可能的属性名
+            for attr_name in ["client", "session", "http_client", "_http"]:
+                client = getattr(cas, attr_name, None)
+                if client is not None:
+                    logger.info(f"[RAW-REQUEST] 找到 httpx client 在属性: {attr_name}")
+                    break
+        
+        if client is None:
+            logger.error(f"[RAW-ERROR] CASClient 上找不到 httpx client！可用属性: {[a for a in dir(cas) if not a.startswith('__')]}")
+            raise RuntimeError("无法从 CASClient 获取 httpx client")
+        
+        logger.info(f"[RAW-REQUEST] client 类型: {type(client).__name__}, base_url: {getattr(client, 'base_url', 'N/A')}")
+        cookies_dict = dict(client.cookies)
+        logger.info(f"[RAW-REQUEST] cookies(发送前): {list(cookies_dict.keys()) if cookies_dict else '(空)'}")
+        
         response = await client.request(method.upper(), full_url, **kwargs)
+        
+        logger.info(f"[RAW-REQUEST] 响应 status={response.status_code}, url={response.url}")
         return response

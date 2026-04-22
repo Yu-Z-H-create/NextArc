@@ -158,10 +158,41 @@ class AuthSessionContext:
             raise RuntimeError("无法从 CASClient 获取 httpx client")
         
         logger.info(f"[RAW-REQUEST] client 类型: {type(client).__name__}, base_url: {getattr(client, 'base_url', 'N/A')}")
-        cookies_dict = dict(client.cookies)
-        logger.info(f"[RAW-REQUEST] cookies(发送前): {list(cookies_dict.keys()) if cookies_dict else '(空)'}")
+        # 安全获取 cookies 列表（避免 CookieConflict 异常）
+        try:
+            cookies_dict = dict(client.cookies)
+            logger.info(f"[RAW-REQUEST] cookies(发送前): {list(cookies_dict.keys()) if cookies_dict else '(空)'}")
+        except Exception as cookie_err:
+            logger.info(f"[RAW-REQUEST] cookies(发送前): (无法读取: {cookie_err})")
         
-        response = await client.request(method.upper(), full_url, follow_redirects=True, **kwargs)
+        # 手动处理重定向：httpx 对 POST 的 301/302 会变成 GET（丢失 body）
+        # 我们手动跟随，保留原始方法(method)和参数(kwargs)
+        max_redirects = 5
+        response = await client.request(method.upper(), full_url, **kwargs)
         
-        logger.info(f"[RAW-REQUEST] 响应 status={response.status_code}, url={response.url}, final_url={str(response.url)}")
+        for _ in range(max_redirects):
+            if response.status_code not in (301, 302, 303, 307, 308):
+                break
+            
+            location = response.headers.get("location", "")
+            if not location:
+                logger.warning(f"[RAW-REQUEST] {response.status_code} 无 Location header")
+                break
+            
+            # 拼接绝对 URL
+            if location.startswith("/"):
+                from urllib.parse import urljoin
+                location = urljoin(full_url + "/", location.lstrip("/"))
+            
+            logger.info(f"[RAW-REQUEST] 跟随重定向: {response.status_code} → {location}")
+            
+            # 307/308 保留方法和 body；其他状态码按标准行为
+            if response.status_code in (307, 308):
+                response = await client.request(method.upper(), location, **kwargs)
+            else:
+                # 301/302/303 → GET（但我们要保留 POST body 因为这是 API）
+                # 青年网 API 实际上期望 POST 到重定向后的地址
+                response = await client.request("POST", location, **kwargs)
+        
+        logger.info(f"[RAW-REQUEST] 响应 status={response.status_code}, url={str(response.url)}")
         return response

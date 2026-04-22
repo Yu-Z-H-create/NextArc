@@ -242,6 +242,19 @@ class ValidHandler(CommandHandler):
             logger.error(f"查询可报名活动失败: {e}")
             import traceback
             traceback.print_exc()
+
+            # 网络相关错误给用户友好提示
+            error_msg = str(e)
+            is_network_error = any(kw in error_msg.lower() for kw in [
+                "timeout", "connect", "connection", "network", "readtimeout",
+                "connecttimeout", "resolv", "refused",
+            ])
+            if isinstance(e, ConnectionError) or is_network_error:
+                return Response.text(
+                    f"⚠️ 连接青年网超时\n\n"
+                    f"错误详情: {error_msg[:150]}\n\n"
+                    f"请检查 VM 网络（ping passport.ustc.edu.cn）后重试"
+                )
             return Response.error(str(e), context="查询可报名活动")
 
     async def _get_valid_activities(self, db_path) -> list[SecondClass]:

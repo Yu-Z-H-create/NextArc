@@ -638,18 +638,36 @@ class CardActionHandler:
             logger.error(f"获取二维码失败: {e}")
             import traceback
             traceback.print_exc()
-            error_msg = (
-                f"二维码获取失败\n\n"
-                f"活动：{activity_name}\n"
-                f"错误：{str(e)}"
-            )
+
+            # 网络错误友好提示
+            err_str = str(e)
+            is_network = any(kw in err_str.lower() for kw in [
+                "timeout", "connect", "connection", "network", "readtimeout",
+                "connecttimeout", "resolv", "refused",
+            ])
+            if is_network:
+                toast_content = "连接超时，请检查网络"
+                error_msg = (
+                    f"⚠️ 二维码获取失败（网络超时）\n\n"
+                    f"活动：{activity_name}\n"
+                    f"原因：VM 访问 passport.ustc.edu.cn 超时\n\n"
+                    f"请在 VM 上执行: ping -c 3 passport.ustc.edu.cn"
+                )
+            else:
+                toast_content = f"获取失败: {str(e)[:50]}"
+                error_msg = (
+                    f"二维码获取失败\n\n"
+                    f"活动：{activity_name}\n"
+                    f"错误：{str(e)}"
+                )
+
             try:
                 await self._bot.send_text(error_msg)
             except Exception:
                 pass
 
             return {
-                "toast": {"type": "error", "content": f"获取失败: {str(e)[:50]}"}
+                "toast": {"type": "error", "content": toast_content}
             }
 
     @staticmethod

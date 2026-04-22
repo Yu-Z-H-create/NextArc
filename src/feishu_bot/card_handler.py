@@ -501,10 +501,21 @@ class CardActionHandler:
                 # ===== 调试：检查 CAS 登录状态 =====
                 logger.info(f"[QR-DEBUG] CAS 登录成功, service 类型: {type(service).__name__}")
 
+                # 构造带完整浏览器 headers 的请求
+                qr_headers = {
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Content-Type": "application/json;charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": "https://young.ustc.edu.cn",
+                    "Referer": f"https://young.ustc.edu.cn/mobile/item/projectdt?id={activity_id}",
+                }
+
                 # ===== 调试：签到码请求 =====
                 logger.info(f"[QR-DEBUG] >>> 发送签到码 POST 请求...")
+                logger.info(f"[QR-DEBUG] headers: {qr_headers}")
                 sign_in_resp = await session_ctx.raw_request(
-                    "POST", qr_api_path, json=qr_payload,
+                    "POST", qr_api_path, json=qr_payload, headers=qr_headers,
                 )
                 logger.info(f"[QR-DEBUG] <<< 签到码响应:")
                 logger.info(f"[QR-DEBUG]   status_code: {sign_in_resp.status_code}")
@@ -543,7 +554,7 @@ class CardActionHandler:
                 # ===== 调试：签退码请求（同一个 activity_id） =====
                 logger.info(f"[QR-DEBUG] >>> 发送签退码 POST 请求...")
                 sign_out_resp = await session_ctx.raw_request(
-                    "POST", qr_api_path, json=qr_payload,
+                    "POST", qr_api_path, json=qr_payload, headers=qr_headers,
                 )
                 logger.info(f"[QR-DEBUG] <<< 签退码响应:")
                 logger.info(f"[QR-DEBUG]   status_code: {sign_out_resp.status_code}")

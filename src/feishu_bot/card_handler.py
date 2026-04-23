@@ -475,9 +475,11 @@ class CardActionHandler:
     async def _handle_get_qr(self, activity_id: str, activity_name: str) -> dict:
         """获取活动的签到二维码，通过飞书消息返回
 
-        策略（v12）：
-        1. 先尝试 pyustc 加密 API 通道（/login/wisdom-group-learning-bg/）
-        2. 如果失败，降级走前端 session（预访问活动详情页 → POST createWxaCodeUnlimit）
+        策略（v13）：
+        1. 加密通道 A：直接用 service._client 发 POST 到加密通道路径，JSON body 不加密
+           （createWxaCodeUnlimit 可能不走 AES 解密流程）
+        2. 加密通道 B：用 pyustc 的 service.request() 标准 AES 加密方式
+        3. 如果都失败，降级走前端 session（预访问活动详情页 → POST createWxaCodeUnlimit）
 
         注意：createWxaCodeUnlimit 返回的是带 scene 参数的小程序码，
         签到和签退用同一个码，不需要分别请求。
@@ -497,25 +499,43 @@ class CardActionHandler:
 
         qr_code_b64 = ""
 
-        # ===== 策略一：走 pyustc 加密 API 通道 =====
+        # ===== 策略一：加密通道（两种方式都试） =====
         # 后端路径: /login/wisdom-group-learning-bg/mobile/item/createWxaCodeUnlimit
         logger.info("[QR] ====== 策略一：加密 API 通道 ======")
         try:
             session_ctx = self._auth_manager.create_session_once()
             async with session_ctx:
+
+                # 方式 A: 不加密参数，直接发 JSON body
+                # createWxaCodeUnlimit 可能不走 AES 解密，期望原始 JSON
+                logger.info("[QR] --- 方式A: 加密通道 + 明文JSON ---")
                 try:
                     result = await session_ctx.encrypted_request(
-                        "/mobile/item/createWxaCodeUnlimit",
-                        method="post",
-                        json_data=qr_payload,
+                        qr_url, method="post", json_data=qr_payload,
                     )
                     if isinstance(result, dict) and result.get("success") and result.get("message"):
                         qr_code_b64 = result["message"]
-                        logger.info(f"[QR] ✅ 加密通道成功! (b64len={len(qr_code_b64)})")
+                        logger.info(f"[QR] ✅ 方式A成功! (b64len={len(qr_code_b64)})")
                     else:
-                        logger.warning(f"[QR] 加密通道返回失败: {str(result)[:200]}")
-                except Exception as e_enc:
-                    logger.warning(f"[QR] 加密通道失败: {e_enc}")
+                        logger.warning(f"[QR] 方式A返回: {str(result)[:200]}")
+                except Exception as e_a:
+                    logger.warning(f"[QR] 方式A失败: {e_a}")
+
+                # 方式 B: 如果方式A失败，尝试 pyustc 标准 AES 加密
+                if not qr_code_b64:
+                    logger.info("[QR] --- 方式B: 加密通道 + AES加密参数 ---")
+                    try:
+                        result = await session_ctx.encrypted_request_aes(
+                            qr_url, method="post", json_data=qr_payload,
+                        )
+                        if isinstance(result, dict) and result.get("success") and result.get("message"):
+                            qr_code_b64 = result["message"]
+                            logger.info(f"[QR] ✅ 方式B成功! (b64len={len(qr_code_b64)})")
+                        else:
+                            logger.warning(f"[QR] 方式B返回: {str(result)[:200]}")
+                    except Exception as e_b:
+                        logger.warning(f"[QR] 方式B失败: {e_b}")
+
         except Exception as e_session:
             logger.warning(f"[QR] 加密通道会话建立失败: {e_session}")
 

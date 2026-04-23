@@ -209,26 +209,57 @@ class AuthSessionContext:
         logger.debug("认证会话已关闭")
 
     async def encrypted_request(self, url: str, method: str = "post", json_data: dict | None = None) -> dict:
-        """通过 pyustc 的加密 API 通道发起请求
+        """通过 pyustc 的加密通道 URL 发起请求（不加密参数）
 
-        直接调用 YouthService.request()，它会自动拼接:
-        /login/wisdom-group-learning-bg/{url} + AES加密参数 + x-access-token
+        复用 YouthService 的 _client（已认证、带 x-access-token），
+        但不使用 service.request()（它会 AES 加密参数）。
 
-        注意：传入的 url 应该是完整的后端路径，例如:
-        - "/mobile/item/createWxaCodeUnlimit" (前端 API 在后端的映射)
-        - "/item/scItem/queryById" (纯后端 API)
-        pyustc 内部会用 urljoin 拼接到 /login/wisdom-group-learning-bg/ 下。
+        某些 API（如 createWxaCodeUnlimit）虽然注册在
+        /login/wisdom-group-learning-bg/ 路径下，但不走 AES 解密流程，
+        期望收到原始 JSON body。
+
+        所以我们直接用 _client 发请求，手动拼接加密通道路径。
         """
         if not self._service or not hasattr(self._service, '_access_token'):
             raise RuntimeError("YouthService 未登录或无 access_token")
 
         service = self._service
-        # 不再额外加 /mobile/item/ 前缀，由调用方决定完整路径
+        client = service._client
+
+        # 拼接到加密通道路径（但不加密参数）
+        effective_url = url if url.startswith("/") else f"/{url}"
+        bg_url = f"/login/wisdom-group-learning-bg{effective_url}"
+
+        logger.info(f"[ENCRYPTED-RAW] {method.upper()} {bg_url}")
+        if json_data:
+            logger.debug(f"[ENCRYPTED-RAW] payload: {json_data}")
+
+        try:
+            resp = await client.request(method, bg_url, json=json_data)
+            result = resp.json()
+            logger.info(f"[ENCRYPTED-RAW] 响应: {str(result)[:200]}")
+            return result
+        except Exception as e:
+            logger.error(f"[ENCRYPTED-RAW] 请求失败: {e}")
+            raise
+
+    async def encrypted_request_aes(self, url: str, method: str = "post", json_data: dict | None = None) -> dict:
+        """通过 pyustc 加密通道 + AES 加密参数发起请求
+
+        使用 pyustc YouthService 的标准 request() 方法，
+        参数经过 AES 加密（requestParams 字段）。
+
+        这适用于走标准 AES 解密流程的 API。
+        """
+        if not self._service or not hasattr(self._service, '_access_token'):
+            raise RuntimeError("YouthService 未登录或无 access_token")
+
+        service = self._service
         effective_url = url if url.startswith("/") else f"/{url}"
 
-        logger.info(f"[ENCRYPTED] {method.upper()} {effective_url}")
+        logger.info(f"[ENCRYPTED-AES] {method.upper()} {effective_url}")
         if json_data:
-            logger.debug(f"[ENCRYPTED] payload: {json_data}")
+            logger.debug(f"[ENCRYPTED-AES] payload: {json_data}")
 
         try:
             result = await service.request(
@@ -237,10 +268,10 @@ class AuthSessionContext:
                 json=json_data,
                 need_token=True,
             )
-            logger.info(f"[ENCRYPTED] 响应: {str(result)[:200]}")
+            logger.info(f"[ENCRYPTED-AES] 响应: {str(result)[:200]}")
             return result
         except Exception as e:
-            logger.error(f"[ENCRYPTED] 请求失败: {e}")
+            logger.error(f"[ENCRYPTED-AES] 请求失败: {e}")
             raise
 
     async def raw_request(self, method: str, url: str, **kwargs) -> httpx.Response:

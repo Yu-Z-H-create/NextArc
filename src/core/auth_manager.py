@@ -139,6 +139,38 @@ class AuthSessionContext:
         except Exception as e:
             logger.warning(f"[WEB-SESSION] 首页访问失败(非致命): {e}")
 
+    async def warmup_activity_page(self, activity_id: str):
+        """预访问活动详情页，为前端 API 调用建立 session context
+        
+        前端的 createWxaCodeUnlimit 需要在一个已访问过活动详情页的 session 中才能工作，
+        否则会被重定向到 main.psp（"访问地址无效"提示页）。
+        
+        浏览器中，用户是先打开活动详情页 /mobile/item/projectdt?id=xxx，
+        然后点击按钮触发 createWxaCodeUnlimit AJAX 请求。
+        我们需要模拟这个过程。
+        """
+        if not self._web_client:
+            logger.warning("[WARMUP] web_client 未初始化，跳过")
+            return
+        
+        url = f"/mobile/item/projectdt?id={activity_id}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        try:
+            resp = await self._web_client.get(url, headers=headers)
+            ct = resp.headers.get('content-type', '')
+            is_html = 'text/html' in ct.lower()
+            final_url = str(resp.url)
+            logger.info(
+                f"[WARMUP] 活动页 {activity_id}: "
+                f"status={resp.status_code}, ct={'html' if is_html else ct[:30]}, "
+                f"url={final_url[:80]}"
+            )
+        except Exception as e:
+            logger.warning(f"[WARMUP] 活动页访问失败(非致命): {e}")
+
     async def _cleanup_partial(self):
         """清理部分初始化的对象"""
         # 先清理 web_client
@@ -178,23 +210,26 @@ class AuthSessionContext:
 
     async def encrypted_request(self, url: str, method: str = "post", json_data: dict | None = None) -> dict:
         """通过 pyustc 的加密 API 通道发起请求
-        
-        复用 YouthService 的 request() 方法，走:
+
+        直接调用 YouthService.request()，它会自动拼接:
         /login/wisdom-group-learning-bg/{url} + AES加密参数 + x-access-token
-        
-        这与 pyustc 内部调用报名/查询等 API 的方式完全一致。
-        用于尝试调用 createWxaCodeUnlimit 等可能在后端也有映射的 API。
+
+        注意：传入的 url 应该是完整的后端路径，例如:
+        - "/mobile/item/createWxaCodeUnlimit" (前端 API 在后端的映射)
+        - "/item/scItem/queryById" (纯后端 API)
+        pyustc 内部会用 urljoin 拼接到 /login/wisdom-group-learning-bg/ 下。
         """
         if not self._service or not hasattr(self._service, '_access_token'):
             raise RuntimeError("YouthService 未登录或无 access_token")
-        
+
         service = self._service
-        effective_url = f"/mobile/item/{url.lstrip('/')}"
-        
+        # 不再额外加 /mobile/item/ 前缀，由调用方决定完整路径
+        effective_url = url if url.startswith("/") else f"/{url}"
+
         logger.info(f"[ENCRYPTED] {method.upper()} {effective_url}")
         if json_data:
             logger.debug(f"[ENCRYPTED] payload: {json_data}")
-        
+
         try:
             result = await service.request(
                 effective_url,

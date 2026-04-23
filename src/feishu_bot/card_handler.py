@@ -473,12 +473,14 @@ class CardActionHandler:
             }
 
     async def _handle_get_qr(self, activity_id: str, activity_name: str) -> dict:
-        """获取活动的签到+签退二维码，通过飞书消息返回
-        
-        策略（v3）：
-        - 最多重试 MAX_QR_RETRIES 次，每次用全新的 CAS 登录会话
-        - 这是因为浏览器也需要多次尝试才能成功 → 服务端本身不稳定
-        - 签到码和签退码用同一个成功的会话获取
+        """获取活动的签到二维码，通过飞书消息返回
+
+        策略（v12）：
+        1. 先尝试 pyustc 加密 API 通道（/login/wisdom-group-learning-bg/）
+        2. 如果失败，降级走前端 session（预访问活动详情页 → POST createWxaCodeUnlimit）
+
+        注意：createWxaCodeUnlimit 返回的是带 scene 参数的小程序码，
+        签到和签退用同一个码，不需要分别请求。
         """
         if not self._auth_manager or not self._bot:
             return {
@@ -487,138 +489,99 @@ class CardActionHandler:
 
         logger.info(f"获取二维码: {activity_name} ({activity_id})")
 
-        MAX_QR_RETRIES = 5  # 每种二维码最多尝试 5 次全新登录（服务端不稳定，浏览器也需要多次试）
-        
-        import base64
-
-        qr_api_path = "/mobile/item/createWxaCodeUnlimit"
         qr_payload = {
             "page": "pagesA/projectdt/projectdt",
             "scene": str(activity_id),
             "appId": "",
         }
-        
-        # 构造带浏览器风格的 headers
-        qr_headers = {
-            "Accept": "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Content-Type": "application/json;charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": "https://young.ustc.edu.cn",
-            "Referer": f"https://young.ustc.edu.cn/mobile/item/projectdt?id={activity_id}",
-        }
 
-        sign_in_b64 = ""
-        sign_out_b64 = ""
+        qr_code_b64 = ""
 
         # ===== 策略一：走 pyustc 加密 API 通道 =====
-        # /login/wisdom-group-learning-bg/mobile/item/createWxaCodeUnlimit
-        # 这与 pyustc 内部调用报名/查询等 API 的方式完全一致
+        # 后端路径: /login/wisdom-group-learning-bg/mobile/item/createWxaCodeUnlimit
         logger.info("[QR] ====== 策略一：加密 API 通道 ======")
         try:
             session_ctx = self._auth_manager.create_session_once()
             async with session_ctx:
                 try:
                     result = await session_ctx.encrypted_request(
-                        "createWxaCodeUnlimit",
+                        "/mobile/item/createWxaCodeUnlimit",
                         method="post",
                         json_data=qr_payload,
                     )
                     if isinstance(result, dict) and result.get("success") and result.get("message"):
-                        sign_in_b64 = result["message"]
-                        logger.info(f"[QR] ✅ 加密通道签到码成功! (b64len={len(sign_in_b64)})")
-                        
-                        # 签退码
-                        try:
-                            result2 = await session_ctx.encrypted_request(
-                                "createWxaCodeUnlimit",
-                                method="post",
-                                json_data=qr_payload,
-                            )
-                            if isinstance(result2, dict) and result2.get("success") and result2.get("message"):
-                                sign_out_b64 = result2["message"]
-                                logger.info(f"[QR] ✅ 加密通道签退码也成功! (b64len={len(sign_out_b64)})")
-                        except Exception as e2:
-                            logger.warning(f"[QR] 加密通道签退码失败: {e2}")
+                        qr_code_b64 = result["message"]
+                        logger.info(f"[QR] ✅ 加密通道成功! (b64len={len(qr_code_b64)})")
+                    else:
+                        logger.warning(f"[QR] 加密通道返回失败: {str(result)[:200]}")
                 except Exception as e_enc:
                     logger.warning(f"[QR] 加密通道失败: {e_enc}")
         except Exception as e_session:
             logger.warning(f"[QR] 加密通道会话建立失败: {e_session}")
 
-        # ===== 策略二：如果加密通道失败，降级走前端 session（重试） =====
-        if not sign_in_b64 and not sign_out_b64:
-            logger.info("[QR] ====== 策略二：前端 session 重试 ======")
-            for attempt in range(1, MAX_QR_RETRIES + 1):
-                logger.info(f"[QR] 前端尝试 {attempt}/{MAX_QR_RETRIES}, scene={activity_id}")
-                
+        # ===== 策略二：前端 session + 预访问活动详情页 =====
+        if not qr_code_b64:
+            logger.info("[QR] ====== 策略二：前端 session + 预访问 ======")
+            MAX_RETRIES = 3
+            for attempt in range(1, MAX_RETRIES + 1):
+                logger.info(f"[QR] 前端尝试 {attempt}/{MAX_RETRIES}, scene={activity_id}")
+
                 try:
                     session_ctx = self._auth_manager.create_session_once()
-                    
                     async with session_ctx:
+                        # 先访问活动详情页，建立前端 session context
+                        await session_ctx.warmup_activity_page(activity_id)
+                        
+                        # 构造浏览器风格的 headers
+                        qr_headers = {
+                            "Accept": "application/json, text/javascript, */*; q=0.01",
+                            "Content-Type": "application/json;charset=UTF-8",
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Origin": "https://young.ustc.edu.cn",
+                            "Referer": f"https://young.ustc.edu.cn/mobile/item/projectdt?id={activity_id}",
+                        }
+                        
                         resp = await session_ctx.raw_request(
-                            "POST", qr_api_path, json=qr_payload, headers=qr_headers,
+                            "POST", "/mobile/item/createWxaCodeUnlimit",
+                            json=qr_payload, headers=qr_headers,
                         )
                         
                         data = self._parse_qr_response(resp)
                         ct = resp.headers.get('content-type', '')
-                        
+
                         if isinstance(data, dict) and data.get("success") and data.get("message"):
-                            sign_in_b64 = data["message"]
-                            logger.info(f"[QR] ✅ 前端签到码成功! (attempt={attempt}, b64len={len(sign_in_b64)})")
-                            
-                            try:
-                                resp2 = await session_ctx.raw_request(
-                                    "POST", qr_api_path, json=qr_payload, headers=qr_headers,
-                                )
-                                data2 = self._parse_qr_response(resp2)
-                                if isinstance(data2, dict) and data2.get("success") and data2.get("message"):
-                                    sign_out_b64 = data2["message"]
-                                    logger.info(f"[QR] ✅ 前端签退码也成功!")
-                            except Exception as e2:
-                                logger.warning(f"[QR] 前端签退码请求异常: {e2}")
-                            
+                            qr_code_b64 = data["message"]
+                            logger.info(f"[QR] ✅ 前端成功! (attempt={attempt}, b64len={len(qr_code_b64)})")
                             break
-                            
                         else:
                             reason = "HTML错误页" if 'text/html' in ct.lower() else str(data)[:100]
-                            logger.warning(f"[QR] ❌ 前端attempt={attempt} 失败: {reason}")
-                            
-                            if attempt < MAX_QR_RETRIES:
+                            logger.warning(f"[QR] ❌ attempt={attempt} 失败: {reason}")
+                            if attempt < MAX_RETRIES:
                                 import asyncio
-                                await asyncio.sleep(1.0)
+                                await asyncio.sleep(2.0)
                             continue
 
                 except Exception as e:
-                    logger.warning(f"[QR] 前端attempt={attempt} 异常: {e}")
-                    if attempt < MAX_QR_RETRIES:
+                    logger.warning(f"[QR] attempt={attempt} 异常: {e}")
+                    if attempt < MAX_RETRIES:
                         import asyncio
-                        await asyncio.sleep(1.0)
-                        continue
+                        await asyncio.sleep(2.0)
+                    continue
 
-        # ===== 结果汇总 =====
-        if not sign_in_b64 and not sign_out_b64:
-            logger.error(f"[QR] 所有 {MAX_QR_RETRIES} 次尝试均失败")
+        # ===== 结果处理 =====
+        if not qr_code_b64:
+            logger.error(f"[QR] 所有策略均失败")
             return {
                 "toast": {"type": "error", "content": "二维码获取失败，服务端可能暂时不可用，请稍后再试"}
             }
 
-        # ===== 发送结果 =====
-        msg_parts = [f"📋 {activity_name} 签到/签退二维码\n"]
-        if sign_in_b64:
-            msg_parts.append("✅ **签到码**：见下方图片")
-        if sign_out_b64:
-            msg_parts.append("⏪ **签退码**：见下方图片")
+        # 发送二维码图片
+        msg = f"📋 {activity_name}\n\n✅ 签到/签退二维码（见下方图片）\n提示：同一个码可用于签到和签退"
+        await self._bot.send_text(msg)
 
-        await self._bot.send_text("\n".join(msg_parts))
-
-        # 逐张发送图片
-        for label, b64_data in [("签到", sign_in_b64), ("签退", sign_out_b64)]:
-            if not b64_data:
-                continue
-            
-            success = await self._send_qr_image(label, b64_data, bot=self._bot)
-            if not success:
-                logger.error(f"[QR] 发送{label}码图片失败")
+        success = await self._send_qr_image("签到", qr_code_b64, bot=self._bot)
+        if not success:
+            logger.error("[QR] 发送二维码图片失败")
 
         return {
             "toast": {"type": "success", "content": f"正在获取 {activity_name} 的二维码..."}

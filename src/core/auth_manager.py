@@ -123,118 +123,57 @@ class AuthSessionContext:
         
         用于调用 pyustc 未封装的 API（如 createWxaCodeUnlimit）。
         
-        核心发现：
-        - YouthService._client.cookies 为空！认证不靠 cookie
-        - 真正的认证凭证是 _client.headers 中的 x-access-token (JWT)
-        - 必须在请求中携带这个 token 才能通过服务端验证
+        策略：直接使用 YouthService._client（已认证的 AsyncClient），
+        它自带 x-access-token、正确 base_url 等完整认证信息。
+        只需要注入 API 特定的 headers。
+        
+        关键发现：
+        - YouthService._client.cookies 为空，认证靠 x-access-token (JWT) header
+        - 服务端对 /mobile/item/* 路径有特殊的路由重定向行为
+        - 必须用 YouthService 自身的客户端，不能创建独立客户端
         """
         base_url = "https://young.ustc.edu.cn"
         full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
 
         logger.info(f"[RAW-REQUEST] {method} {full_url}")
         
-        # ============================================================
-        # 关键：从 YouthService._client.headers 提取 x-access-token (JWT)
-        # ============================================================
-        access_token = None
+        if not self._service or not hasattr(self._service, '_client') or not self._service._client:
+            raise RuntimeError("YouthService 未登录或 _client 不可用")
         
-        if self._service and hasattr(self._service, '_client') and self._service._client:
-            try:
-                client_headers = dict(self._service._client.headers)
-                access_token = client_headers.get('x-access-token')
-                if access_token:
-                    logger.info(f"[RAW-REQUEST] ✅ 找到 x-access-token (长度={len(access_token)})")
-                else:
-                    logger.warning(f"[RAW-REQUEST] ⚠️ YouthService._client 无 x-access-token! headers keys: {list(client_headers.keys())}")
-            except Exception as e:
-                logger.error(f"[RAW-REQUEST] 读取 headers 失败: {e}")
+        client = self._service._client
         
-        if not access_token:
-            logger.error("[RAW-REQUEST] ❌ 无法获取 x-access-token，请求将失败!")
+        # 打印客户端状态用于诊断
+        logger.info(f"[RAW-REQUEST] 使用 YouthService._client:")
+        logger.info(f"[RAW-REQUEST]   base_url={client.base_url}")
+        logger.info(f"[RAW-REQUEST]   headers keys={list(dict(client.headers).keys())}")
+        logger.info(f"[RAW-REQUEST]   cookies={list(dict(client.cookies).keys())} ({len(list(client.cookies))}个)")
+        logger.info(f"[RAW-REQUEST]   follow_redirects={getattr(client, 'follow_redirects', 'N/A')}")
         
-        # 合并自定义 headers，注入 x-access-token
-        merged_headers = kwargs.get('headers', {}).copy()
-        if access_token:
-            merged_headers['x-access-token'] = access_token
-            logger.info("[RAW-REQUEST] 已注入 x-access-token 到请求头")
+        # 合并自定义 headers 到已有 headers 中
+        merged_headers = dict(client.headers)
+        custom_headers = kwargs.pop('headers', {})
+        merged_headers.update(custom_headers)
         
-        # 也收集 CAS cookies 作为补充
-        all_cookies = {}
-        if self._cas_client:
-            for cas_attr in ["_client", "client"]:
-                cas_c = getattr(self._cas_client, cas_attr, None)
-                if cas_c is not None and hasattr(cas_c, 'cookies'):
-                    try:
-                        for k, v in dict(cas_c.cookies).items():
-                            all_cookies[k] = str(v)
-                    except Exception:
-                        pass
+        # 记录实际发送的 headers（隐藏 token 值）
+        log_headers = {k: (v[:20]+'...' if len(str(v))>20 else v) for k,v in merged_headers.items()}
+        logger.info(f"[RAW-REQUEST] 最终headers: {log_headers}")
         
-        # ============================================================
-        # 创建独立客户端，手动控制重定向，携带 x-access-token
-        # ============================================================
-        client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0),
-            follow_redirects=False,
-            verify=True,
+        logger.info(f"[RAW-REQUEST] Body: {kwargs.get('json', kwargs.get('data', '(无body)'))}")
+        
+        # 直接用 YouthService 的已认证客户端发请求（它会自动处理重定向和认证）
+        response = await client.request(
+            method.upper(),
+            full_url,
+            headers=merged_headers,
+            **kwargs,
         )
         
-        kwargs['headers'] = merged_headers
+        logger.info(f"[RAW-REQUEST] 响应: status={response.status_code}, url={str(response.url)}")
+        logger.info(f"[RAW-REQUEST] 响应content-type: {response.headers.get('content-type', 'N/A')}")
         
-        try:
-            return await self._do_raw_request_with_cookies(client, full_url, method.upper(), all_cookies, **kwargs)
-        finally:
-            await client.aclose()
-
-    async def _do_raw_request_with_cookies(self, client, full_url, method, cookies, **kwargs) -> httpx.Response:
-        """使用指定 cookie 执行请求，手动处理重定向"""
-        max_redirects = 5
-        current_url = full_url
-        
-        for attempt in range(max_redirects + 1):
-            req_headers = kwargs.get('headers', {}).copy()
-            
-            logger.info(f"[RAW-REQUEST] === 请求 #{attempt+1}: {method} {current_url} ===")
-            logger.info(f"[RAW-REQUEST] Cookies: {list(cookies.keys())}")
-            if 'json' in kwargs:
-                logger.info(f"[RAW-REQUEST] Body: {kwargs['json']}")
-            
-            response = await client.request(
-                method, current_url,
-                json=kwargs.get('json'),
-                data=kwargs.get('data'),
-                headers=req_headers,
-                cookies=cookies,
-            )
-            
-            logger.info(f"[RAW-REQUEST] 响应 #{attempt+1}: status={response.status_code}, url={str(response.url)}")
-            
-            if response.status_code not in (301, 302, 303, 307, 308):
-                new_cookies_from_response = dict(response.cookies)
-                if new_cookies_from_response:
-                    logger.info(f"[RAW-REQUEST] 响应 Set-Cookie: {new_cookies_from_response}")
-                return response
-            
-            location = response.headers.get("location", "")
-            logger.warning(f"[RAW-REQUEST] 重定向! {response.status_code} → '{location}'")
-            logger.info(f"[RAW-REQUEST] 重定向体: {response.text[:200]}")
-            
-            if not location:
-                return response
-            
-            if not location.startswith(("http://", "https://")):
-                from urllib.parse import urljoin
-                location = urljoin(current_url.rstrip("/") + "/", location)
-            
-            new_cookies = dict(response.cookies)
-            if new_cookies:
-                cookies.update({k: str(v) for k, v in new_cookies.items()})
-            
-            current_url = location
-            
-            if response.status_code == 303:
-                method = "GET"
-                kwargs.pop('json', None)
-                kwargs.pop('data', None)
+        # 检查是否是 HTML 错误页
+        ct = response.headers.get('content-type', '')
+        if 'text/html' in ct.lower():
+            logger.warning(f"[RAW-REQUEST] ⚠️ 收到HTML响应(非JSON)，前200字: {response.text[:200]}")
         
         return response

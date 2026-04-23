@@ -2,6 +2,7 @@
 
 import asyncio
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -48,6 +49,7 @@ class AuthSessionContext:
         self._service = None          # YouthService 实例
         self._cas_obj = None          # CASClient.__aenter__ 返回值
         self._service_obj = None      # YouthService.__aenter__ 返回值
+        self._web_client = None       # 用于前端页面请求的独立 httpx client（带 JSESSIONID）
 
     async def _do_login(self):
         """执行登录，支持重试"""
@@ -71,6 +73,9 @@ class AuthSessionContext:
                     timeout=self.timeout,
                 )
 
+                # 建立前端页面的 SSO session（用于调用 /mobile/* 等前端 API）
+                await self._init_web_session()
+
                 logger.debug("认证会话创建成功")
                 return True
 
@@ -90,8 +95,61 @@ class AuthSessionContext:
                 logger.error(f"认证会话创建失败: {e}")
                 raise
 
+    async def _init_web_session(self):
+        """建立前端页面的 SSO session
+        
+        浏览器访问 young.ustc.edu.cn 的流程：
+        1. 访问 young.ustc.edu.cn 的页面 → 被重定向到 CAS
+        2. CAS 验证通过（已有 SOURCEID_TGC cookie）→ 重定向回 young.ustc.edu.cn 并带 ticket
+        3. young.ustc.edu.cn 用 ticket 建立 JSESSIONID
+        
+        我们需要模拟这个流程来获得有效的 JSESSIONID，
+        用于调用 /mobile/item/createWxaCodeUnlimit 等前端 API。
+        """
+        base_url = "https://young.ustc.edu.cn"
+        
+        # 从 CASClient 获取 CAS 票据
+        cas_service_url = f"{base_url}/login/sc-wisdom-group-learning/"
+        logger.debug(f"[WEB-SESSION] 获取 CAS ticket for {cas_service_url}")
+        
+        ticket = await self._cas_obj.get_ticket(cas_service_url)
+        
+        # 用 ticket 访问 young.ustc.edu.cn 建立 SSO session
+        logger.debug(f"[WEB-SESSION] 用 ticket 建立 JSESSIONID...")
+        
+        self._web_client = httpx.AsyncClient(
+            base_url=base_url,
+            follow_redirects=True,
+            timeout=self.timeout,
+        )
+        await self._web_client.__aenter__()
+        
+        # 访问 SSO 回调地址，让服务端建立 JSESSIONID
+        sso_callback = f"{base_url}/cas/client/checkSsoLogin?ticket={ticket}&service={cas_service_url}"
+        resp = await self._web_client.get(sso_callback)
+        
+        # 记录获得的 cookies
+        cookies = {c.name: c.value[:20] for c in self._web_client.cookies.jar}
+        logger.info(f"[WEB-SESSION] SSO 回调完成, status={resp.status_code}, cookies={cookies}")
+        
+        # 再访问一下首页确保 session 稳定
+        try:
+            index_resp = await self._web_client.get("/mobile/index")
+            logger.debug(f"[WEB-SESSION] 首页访问: status={index_resp.status_code}")
+        except Exception as e:
+            logger.warning(f"[WEB-SESSION] 首页访问失败(非致命): {e}")
+
     async def _cleanup_partial(self):
         """清理部分初始化的对象"""
+        # 先清理 web_client
+        if self._web_client:
+            try:
+                await self._web_client.__aexit__(None, None, None)
+            except Exception:
+                pass
+            finally:
+                self._web_client = None
+        
         if self._service:
             try:
                 await self._service.__aexit__(None, None, None)
@@ -119,144 +177,74 @@ class AuthSessionContext:
         logger.debug("认证会话已关闭")
 
     async def raw_request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """使用已登录的 YouthService 会话发起原始 HTTP 请求
+        """使用前端 session（JSESSIONID）发起原始 HTTP 请求
         
-        用于调用 pyustc 未封装的 API（如 createWxaCodeUnlimit）。
+        用于调用 pyustc 未封装的前端 API（如 createWxaCodeUnlimit）。
         
-        策略（v9）：
-        - 直接使用 YouthService._client（已携带 x-access-token）
-        - 预热获取 JSESSIONID 并注入 cookie jar
-        - 不做重试（由调用方 _handle_get_qr 控制重试逻辑）
+        v10 策略：
+        - 使用独立的 web_client（通过 SSO 回调建立的 JSESSIONID）
+        - 不走 pyustc 的加密 API 通道
+        - 模拟浏览器前端 JS 的请求方式
         
-        关键发现：
-        - x-access-token (JWT) 是主要认证凭据，存储在 YouthService._client.headers 中
-        - 服务端 /mobile/item/* 路径经过页面路由框架
-        - 浏览器也需要多次尝试才能成功 → 服务端本身不稳定
+        与 pyustc 的 request() 方法的区别：
+        - pyustc 走 /login/wisdom-group-learning-bg/ + AES 加密参数 + x-access-token
+        - 这里走 /mobile/* 前端路由 + JSESSIONID cookie（与浏览器一致）
         """
         base_url = "https://young.ustc.edu.cn"
         full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
 
         logger.info(f"[RAW] {method} {full_url}")
         
-        if not self._service or not hasattr(self._service, '_client') or not self._service._client:
-            raise RuntimeError("YouthService 未登录或 _client 不可用")
+        if not self._web_client:
+            raise RuntimeError("Web session (JSESSIONID) 未初始化")
         
-        client = self._service._client
-        
-        # ============================================================
-        # Step 0: 模拟浏览器完整访问路径
-        #   0a. 访问 mobile/index 获取 JSESSIONID
-        #   0b. 如果目标与活动相关，访问活动详情页建立页面 session
-        # ============================================================
-        jsession_id = ''
-        try:
-            logger.debug("[RAW] 预热0a: GET /mobile/index")
-            warm_resp = await client.get(
-                base_url + "/mobile/index",
-                headers={"Accept": "text/html,application/xhtml+xml"},
-                follow_redirects=True,
-            )
-            for cookie in warm_resp.cookies.jar:
-                if cookie.name == 'JSESSIONID':
-                    jsession_id = cookie.value
-                    break
-            
-            if jsession_id:
-                logger.debug(f"[RAW] 预热获得 JSESSIONID: {jsession_id[:8]}...")
-            else:
-                logger.debug(f"[RAW] 预热未返回 JSESSIONID, status={warm_resp.status_code}")
-            
-            # 0b: 如果请求的是 createWxaCodeUnlimit，从 scene 参数提取 activity_id，
-            #     先访问活动详情页（模拟浏览器行为）
-            payload = kwargs.get('json', {})
-            scene = payload.get('scene', '') if isinstance(payload, dict) else ''
-            
-            if 'createWxaCodeUnlimit' in full_url and scene:
-                detail_url = f"{base_url}/mobile/item/projectdt?id={scene}"
-                logger.debug(f"[RAW] 预热0b: GET 活动详情页 {detail_url}")
-                try:
-                    detail_resp = await client.get(
-                        detail_url,
-                        headers={
-                            "Accept": "text/html,application/xhtml+xml",
-                            "Referer": f"{base_url}/mobile/index",
-                        },
-                        follow_redirects=True,
-                    )
-                    logger.debug(f"[RAW] 详情页响应: status={detail_resp.status_code}, "
-                                f"ct={detail_resp.headers.get('content-type','')[:40]}")
-                    
-                    # 收集新 cookies
-                    for cookie in detail_resp.cookies.jar:
-                        if cookie.name == 'JSESSIONID':
-                            jsession_id = cookie.value
-                except Exception as e_detail:
-                    logger.warning(f"[RAW] 详情页预热失败(非致命): {e_detail}")
+        client = self._web_client
 
-        except Exception as e:
-            logger.warning(f"[RAW] 预热失败(非致命): {e}")
-
-        # ============================================================
-        # 合并请求头（保留 x-access-token 等认证信息）
-        # ============================================================
-        merged_headers = dict(client.headers)
+        # 合并请求头（不包含 x-access-token，模拟纯浏览器行为）
         custom_headers = kwargs.pop('headers', {})
-        merged_headers.update(custom_headers)
+        default_headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.120 Mobile Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        default_headers.update(custom_headers)
 
-        # 记录关键请求信息（脱敏 token）
-        log_h = {}
-        for k, v in merged_headers.items():
-            v_str = str(v)
-            if 'token' in k.lower() or 'authorization' in k.lower():
-                log_h[k] = f"{v_str[:20]}...({len(v_str)}ch)"
-            else:
-                log_h[k] = v_str[:80]
-        logger.debug(f"[RAW] headers: {log_h}")
-        
         if 'json' in kwargs:
             logger.debug(f"[RAW] body: {kwargs['json']}")
+        
+        # 记录发送的 cookies
+        try:
+            req_cookies = {c.name: c.value[:20] for c in client.cookies.jar}
+            if req_cookies:
+                logger.info(f"[RAW] cookies: {req_cookies}")
+        except Exception:
+            pass
 
-        # ============================================================
         # 发送实际请求
-        # ============================================================
         response = await client.request(
             method.upper(),
             full_url,
-            headers=merged_headers,
+            headers=default_headers,
             **kwargs,
         )
 
-        # 记录响应摘要
+        # 记录响应
         logger.info(
             f"[RAW] ← {response.status_code} "
             f"ct={response.headers.get('content-type', '?')[:40]} "
             f"url={str(response.url)[:80]}"
         )
         
-        # 诊断：记录发送时的完整 cookies
-        try:
-            req_cookies = {c.name: c.value[:20] for c in client.cookies.jar}
-            if req_cookies:
-                logger.debug(f"[RAW] 发送的cookies: {req_cookies}")
-        except Exception:
-            pass
-        
         ct = response.headers.get('content-type', '')
         if 'text/html' in ct.lower():
-            # 错误页：记录更多内容帮助诊断
             text = response.text
             logger.debug(f"[RAW] HTML body ({len(text)} chars): {text[:500].replace(chr(10), ' ')}")
-            
-            # 尝试提取页面标题/错误信息
             import re
             title_match = re.search(r'<title[^>]*>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
             if title_match:
                 title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
-                logger.debug(f"[RAW] 页面title: {title}")
+                logger.info(f"[RAW] 页面title: {title}")
         elif 'application/json' in ct.lower():
-            text = response.text[:200]
-            logger.info(f"[RAW] JSON: {text}")
-        else:
-            logger.debug(f"[RAW] body ({len(response.content)} bytes): {response.text[:100]}")
+            logger.info(f"[RAW] JSON: {response.text[:200]}")
 
         return response

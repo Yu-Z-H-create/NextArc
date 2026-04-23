@@ -473,7 +473,13 @@ class CardActionHandler:
             }
 
     async def _handle_get_qr(self, activity_id: str, activity_name: str) -> dict:
-        """获取活动的签到+签退二维码，通过飞书消息返回"""
+        """获取活动的签到+签退二维码，通过飞书消息返回
+        
+        策略（v3）：
+        - 最多重试 MAX_QR_RETRIES 次，每次用全新的 CAS 登录会话
+        - 这是因为浏览器也需要多次尝试才能成功 → 服务端本身不稳定
+        - 签到码和签退码用同一个成功的会话获取
+        """
         if not self._auth_manager or not self._bot:
             return {
                 "toast": {"type": "error", "content": "服务未初始化，请稍后重试"}
@@ -481,175 +487,113 @@ class CardActionHandler:
 
         logger.info(f"获取二维码: {activity_name} ({activity_id})")
 
-        try:
-            import base64
-            import httpx
+        MAX_QR_RETRIES = 5  # 每种二维码最多尝试 5 次全新登录（服务端不稳定，浏览器也需要多次试）
+        
+        import base64
 
-            qr_api_path = "/mobile/item/createWxaCodeUnlimit"
-            qr_payload = {
-                "page": "pagesA/projectdt/projectdt",
-                "scene": str(activity_id),
-                "appId": "",
-            }
+        qr_api_path = "/mobile/item/createWxaCodeUnlimit"
+        qr_payload = {
+            "page": "pagesA/projectdt/projectdt",
+            "scene": str(activity_id),
+            "appId": "",
+        }
+        
+        # 构造带浏览器风格的 headers
+        qr_headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Content-Type": "application/json;charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": "https://young.ustc.edu.cn",
+            "Referer": f"https://young.ustc.edu.cn/mobile/item/projectdt?id={activity_id}",
+        }
 
-            logger.info(f"[QR] 请求 createWxaCodeUnlimit, scene={activity_id}")
+        sign_in_b64 = ""
+        sign_out_b64 = ""
 
-            # 复用 auth_manager 已有的 CAS 登录流程，通过 raw_request 调用 API
-            session_ctx = self._auth_manager.create_session_once()
-
-            async with session_ctx as service:
-                # 构造带浏览器风格的 headers（模拟真实前端请求）
-                qr_headers = {
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "Content-Type": "application/json;charset=UTF-8",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Origin": "https://young.ustc.edu.cn",
-                    "Referer": f"https://young.ustc.edu.cn/mobile/item/projectdt?id={activity_id}",
-                }
-
-                # ===== 签到码请求 =====
-                sign_in_resp = await session_ctx.raw_request(
-                    "POST", qr_api_path, json=qr_payload, headers=qr_headers,
-                )
+        # ===== 尝试获取签到码 =====
+        for attempt in range(1, MAX_QR_RETRIES + 1):
+            logger.info(f"[QR] 签到码尝试 {attempt}/{MAX_QR_RETRIES}, scene={activity_id}")
+            
+            try:
+                session_ctx = self._auth_manager.create_session_once()
                 
-                # 解析响应：可能是 JSON 或 HTML 错误页
-                sign_in_data = self._parse_qr_response(sign_in_resp)
-                sign_in_b64 = ""
-                if isinstance(sign_in_data, dict) and sign_in_data.get("success"):
-                    sign_in_b64 = sign_in_data.get("message") or ""
-                    logger.info(f"[QR] 签到码获取成功 (base64长度: {len(sign_in_b64)})")
-                else:
-                    logger.warning(f"[QR] 签到码API返回异常: status={sign_in_resp.status_code}, data={str(sign_in_data)[:200]}")
-
-                # ===== 签退码请求（同一个 activity_id） =====
-                try:
-                    sign_out_resp = await session_ctx.raw_request(
+                async with session_ctx:
+                    resp = await session_ctx.raw_request(
                         "POST", qr_api_path, json=qr_payload, headers=qr_headers,
                     )
-                except Exception as e2:
-                    logger.warning(f"[QR] 签退码请求异常: {e2}")
-                    sign_out_resp = None
-                
-                if sign_out_resp:
-                    sign_out_data = self._parse_qr_response(sign_out_resp)
-                    sign_out_b64 = ""
-                    if isinstance(sign_out_data, dict) and sign_out_data.get("success"):
-                        sign_out_b64 = sign_out_data.get("message") or ""
-                        logger.info(f"[QR] 签退码获取成功 (base64长度: {len(sign_out_b64)})")
+                    
+                    data = self._parse_qr_response(resp)
+                    ct = resp.headers.get('content-type', '')
+                    
+                    # 检查是否拿到有效的 JSON 响应
+                    if isinstance(data, dict) and data.get("success") and data.get("message"):
+                        sign_in_b64 = data["message"]
+                        logger.info(f"[QR] ✅ 签到码成功! (attempt={attempt}, b64len={len(sign_in_b64)})")
+                        
+                        # 用同一个会话立刻拿签退码
+                        try:
+                            resp2 = await session_ctx.raw_request(
+                                "POST", qr_api_path, json=qr_payload, headers=qr_headers,
+                            )
+                            data2 = self._parse_qr_response(resp2)
+                            if isinstance(data2, dict) and data2.get("success") and data2.get("message"):
+                                sign_out_b64 = data2["message"]
+                                logger.info(f"[QR] ✅ 签退码也成功了! (b64len={len(sign_out_b64)})")
+                            else:
+                                logger.warning(f"[QR] 签退码返回异常: {str(data2)[:150]}")
+                        except Exception as e2:
+                            logger.warning(f"[QR] 签退码请求异常: {e2}")
+                        
+                        break  # 成功了，退出重试循环
+                        
                     else:
-                        logger.warning(f"[QR] 签退码API返回异常: status={sign_out_resp.status_code}, data={str(sign_out_data)[:200]}")
-                else:
-                    sign_out_data = {"success": False}
-                    sign_out_b64 = ""
+                        # 这次没成功，记录原因并重试
+                        reason = "HTML错误页" if 'text/html' in ct.lower() else str(data)[:100]
+                        logger.warning(f"[QR] ❌ attempt={attempt} 失败: {reason}")
+                        
+                        if attempt < MAX_QR_RETRIES:
+                            import asyncio
+                            wait_sec = 1.5 * attempt  # 渐进等待：1.5s, 3s
+                            logger.info(f"[QR] 等待 {wait_sec}s 后重试...")
+                            await asyncio.sleep(wait_sec)
+                        continue
 
-            if not sign_in_b64 and not sign_out_b64:
-                return {
-                    "toast": {"type": "error", "content": "二维码获取失败，请检查登录态或活动状态"}
-                }
-
-            # 发送文字说明
-            msg_parts = [f"📋 {activity_name} 签到/签退二维码\n"]
-            if sign_in_b64:
-                msg_parts.append("✅ **签到码**：见下方图片")
-            if sign_out_b64:
-                msg_parts.append("⏪ **签退码**：见下方图片")
-
-            await self._bot.send_text("\n".join(msg_parts))
-
-            # 逐张发送图片
-            for label, b64_data in [("签到", sign_in_b64), ("签退", sign_out_b64)]:
-                if not b64_data:
+            except Exception as e:
+                logger.warning(f"[QR] attempt={attempt} 异常: {e}")
+                if attempt < MAX_QR_RETRIES:
+                    import asyncio
+                    await asyncio.sleep(1.5 * attempt)
                     continue
 
-                try:
-                    img_bytes = base64.b64decode(b64_data)
-
-                    token = await self._get_feishu_token()
-                    if not token:
-                        await self._bot.send_text(f"⚠️ {label}码: 无法上传图片")
-                        continue
-
-                    async with httpx.AsyncClient(timeout=15) as upload_client:
-                        files = {"image": ("qr.png", img_bytes, "image/png")}
-                        upload_resp = await upload_client.post(
-                            "https://open.feishu.cn/open-apis/im/v1/images",
-                            headers={"Authorization": f"Bearer {token}"},
-                            files=files,
-                        )
-                        upload_result = upload_resp.json()
-
-                    if upload_result.get("code") != 0:
-                        logger.warning(f"飞书图片上传失败: {upload_result.get('msg')}")
-                        await self._bot.send_text(f"⚠️ {label}码: 图片上传失败 - {upload_result.get('msg', '未知错误')}")
-                        continue
-
-                    image_key = upload_result["data"]["image_key"]
-
-                    from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-                    from lark_oapi import Client
-
-                    lark_client = Client.builder() \
-                        .app_id(self._bot.app_id) \
-                        .app_secret(self._bot.app_secret) \
-                        .build()
-
-                    body = CreateMessageRequestBody.builder() \
-                        .receive_id(self._bot.get_chat_id()) \
-                        .msg_type("image") \
-                        .content(json.dumps({"image_key": image_key})) \
-                        .receive_id_type("chat_id") \
-                        .build()
-
-                    request = CreateMessageRequest.builder().request_body(body).build()
-                    response = lark_client.im.v1.message.create(request)
-
-                    if not response.success():
-                        logger.warning(f"发送{label}码图片失败: {response.msg}")
-
-                except Exception as img_err:
-                    logger.error(f"处理{label}码图片异常: {img_err}")
-                    await self._bot.send_text(f"⚠️ {label}码: 处理失败 - {str(img_err)[:100]}")
-
+        # ===== 结果汇总 =====
+        if not sign_in_b64 and not sign_out_b64:
+            logger.error(f"[QR] 所有 {MAX_QR_RETRIES} 次尝试均失败")
             return {
-                "toast": {"type": "success", "content": f"正在获取 {activity_name} 的二维码..."}
+                "toast": {"type": "error", "content": "二维码获取失败，服务端可能暂时不可用，请稍后再试"}
             }
 
-        except Exception as e:
-            logger.error(f"获取二维码失败: {e}")
-            import traceback
-            traceback.print_exc()
+        # ===== 发送结果 =====
+        msg_parts = [f"📋 {activity_name} 签到/签退二维码\n"]
+        if sign_in_b64:
+            msg_parts.append("✅ **签到码**：见下方图片")
+        if sign_out_b64:
+            msg_parts.append("⏪ **签退码**：见下方图片")
 
-            # 网络错误友好提示
-            err_str = str(e)
-            is_network = any(kw in err_str.lower() for kw in [
-                "timeout", "connect", "connection", "network", "readtimeout",
-                "connecttimeout", "resolv", "refused",
-            ])
-            if is_network:
-                toast_content = "连接超时，请检查网络"
-                error_msg = (
-                    f"⚠️ 二维码获取失败（网络超时）\n\n"
-                    f"活动：{activity_name}\n"
-                    f"原因：VM 访问 passport.ustc.edu.cn 超时\n\n"
-                    f"请在 VM 上执行: ping -c 3 passport.ustc.edu.cn"
-                )
-            else:
-                toast_content = f"获取失败: {str(e)[:50]}"
-                error_msg = (
-                    f"二维码获取失败\n\n"
-                    f"活动：{activity_name}\n"
-                    f"错误：{str(e)}"
-                )
+        await self._bot.send_text("\n".join(msg_parts))
 
-            try:
-                await self._bot.send_text(error_msg)
-            except Exception:
-                pass
+        # 逐张发送图片
+        for label, b64_data in [("签到", sign_in_b64), ("签退", sign_out_b64)]:
+            if not b64_data:
+                continue
+            
+            success = await self._send_qr_image(label, b64_data, bot=self._bot)
+            if not success:
+                logger.error(f"[QR] 发送{label}码图片失败")
 
-            return {
-                "toast": {"type": "error", "content": toast_content}
-            }
+        return {
+            "toast": {"type": "success", "content": f"正在获取 {activity_name} 的二维码..."}
+        }
 
     @staticmethod
     def _parse_qr_response(resp) -> dict:
@@ -676,6 +620,90 @@ class CardActionHandler:
             return resp.json()
         except Exception:
             return {"success": False, "message": f"非JSON响应 (HTTP {resp.status_code}): {resp.text[:200]}"}
+
+    @staticmethod
+    async def _send_qr_image(label: str, b64_data: str, bot=None) -> bool:
+        """将 base64 编码的二维码图片上传飞书并发送
+        
+        Args:
+            label: 标签名称（签到/签退）
+            b64_data: base64 编码的 PNG 数据
+            bot: FeishuBot 实例（用于获取 chat_id 等）
+        
+        Returns:
+            是否发送成功
+        """
+        try:
+            import base64
+            import httpx
+            from src.config import get_settings
+
+            img_bytes = base64.b64decode(b64_data)
+
+            token = await CardActionHandler._get_feishu_token()
+            if not token:
+                if bot:
+                    await bot.send_text(f"⚠️ {label}码: 无法获取上传凭证")
+                return False
+
+            async with httpx.AsyncClient(timeout=15) as upload_client:
+                files = {"image": ("qr.png", img_bytes, "image/png")}
+                upload_resp = await upload_client.post(
+                    "https://open.feishu.cn/open-apis/im/v1/images",
+                    headers={"Authorization": f"Bearer {token}"},
+                    files=files,
+                )
+                upload_result = upload_resp.json()
+
+            if upload_result.get("code") != 0:
+                logger.warning(f"飞书图片上传失败: {upload_result.get('msg')}")
+                if bot:
+                    await bot.send_text(f"⚠️ {label}码: 上传失败 - {upload_result.get('msg', '?')}")
+                return False
+
+            image_key = upload_result["data"]["image_key"]
+
+            if not bot:
+                logger.warning(f"[QR] 无 bot 实例，无法发送{label}码图片")
+                return False
+
+            settings = get_settings()
+            app_id = settings.feishu.app_id
+            app_secret = settings.feishu.app_secret
+
+            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+            from lark_oapi import Client
+
+            lark_client = Client.builder() \
+                .app_id(app_id) \
+                .app_secret(app_secret) \
+                .build()
+
+            body = CreateMessageRequestBody.builder() \
+                .receive_id(bot.get_chat_id()) \
+                .msg_type("image") \
+                .content(json.dumps({"image_key": image_key})) \
+                .receive_id_type("chat_id") \
+                .build()
+
+            request = CreateMessageRequest.builder().request_body(body).build()
+            response = lark_client.im.v1.message.create(request)
+
+            if response.success():
+                logger.info(f"[QR] ✅ {label}码图片已发送")
+                return True
+            else:
+                logger.warning(f"发送{label}码图片失败: {response.msg}")
+                return False
+
+        except Exception as img_err:
+            logger.error(f"处理{label}码图片异常: {img_err}")
+            if bot:
+                try:
+                    await bot.send_text(f"⚠️ {label}码: 处理失败 - {str(img_err)[:100]}")
+                except Exception:
+                    pass
+            return False
 
     @staticmethod
     async def _get_feishu_token() -> str | None:

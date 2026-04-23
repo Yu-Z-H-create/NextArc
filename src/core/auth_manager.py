@@ -123,20 +123,20 @@ class AuthSessionContext:
         
         用于调用 pyustc 未封装的 API（如 createWxaCodeUnlimit）。
         
-        策略演进：
-        v1-v5: 各种独立客户端方案 → 全部失败（被重定向到 main.psp）
-        v6: 直接用 YouthService._client → 仍然失败
-        v7 (当前): 先预热获取 JSESSIONID，再用完整认证信息发请求
+        策略（v9）：
+        - 直接使用 YouthService._client（已携带 x-access-token）
+        - 预热获取 JSESSIONID 并注入 cookie jar
+        - 不做重试（由调用方 _handle_get_qr 控制重试逻辑）
         
         关键发现：
-        - 服务端对 /mobile/item/* 路径有页面路由框架（Spring MVC?）
-        - 无 JSESSIONID 时，POST 被当成表单提交→重定向到错误页面
-        - 需要先通过 GET 建立服务端 session，获得有效 JSESSIONID
+        - x-access-token (JWT) 是主要认证凭据，存储在 YouthService._client.headers 中
+        - 服务端 /mobile/item/* 路径经过页面路由框架
+        - 浏览器也需要多次尝试才能成功 → 服务端本身不稳定
         """
         base_url = "https://young.ustc.edu.cn"
         full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
 
-        logger.info(f"[RAW-REQUEST] {method} {full_url}")
+        logger.info(f"[RAW] {method} {full_url}")
         
         if not self._service or not hasattr(self._service, '_client') or not self._service._client:
             raise RuntimeError("YouthService 未登录或 _client 不可用")
@@ -144,35 +144,50 @@ class AuthSessionContext:
         client = self._service._client
         
         # ============================================================
-        # Step 0: 预热 - 访问一个页面获取 JSESSIONID
+        # Step 0: 预热 - 用 GET 建立服务端 JSESSIONID session
         # ============================================================
-        logger.info("[RAW-REQUEST] Step 0: 预热获取 JSESSIONID...")
+        jsession_id = ''
         try:
-            warm_resp = await client.get(base_url + "/mobile/index", headers={"Accept": "text/html"})
-            warm_cookies = dict(warm_resp.cookies)
-            logger.info(f"[RAW-REQUEST] 预热响应: status={warm_resp.status_code}, cookies={list(warm_cookies.keys())}")
+            logger.debug("[RAW] 预热: GET /mobile/index")
+            warm_resp = await client.get(
+                base_url + "/mobile/index",
+                headers={"Accept": "text/html,application/xhtml+xml"},
+                follow_redirects=True,
+            )
+            for cookie in warm_resp.cookies.jar:
+                if cookie.name == 'JSESSIONID':
+                    jsession_id = cookie.value
+                    break
             
-            # 提取 JSESSIONID
-            jsession_id = warm_cookies.get('JSESSIONID', '')
+            # 把预热获得的 cookie 注入到 client 的 cookie jar 中
+            # 这样后续请求会自动带上 JSESSIONID
             if jsession_id:
-                logger.info(f"[RAW-REQUEST] ✅ 获取到 JSESSIONID: {jsession_id}")
+                logger.debug(f"[RAW] 预热获得 JSESSIONID: {jsession_id[:8]}...")
+            else:
+                logger.debug(f"[RAW] 预热未返回 JSESSIONID, 响应status={warm_resp.status_code}")
         except Exception as e:
-            logger.warning(f"[RAW-REQUEST] ⚠️ 预热失败(非致命): {e}")
-            jsession_id = ''
-        
+            logger.warning(f"[RAW] 预热失败(非致命): {e}")
+
         # ============================================================
-        # 构建最终请求头
+        # 合并请求头（保留 x-access-token 等认证信息）
         # ============================================================
         merged_headers = dict(client.headers)
         custom_headers = kwargs.pop('headers', {})
         merged_headers.update(custom_headers)
-        
-        log_headers = {k: (str(v)[:30]+'...' if len(str(v))>30 else str(v)) for k,v in merged_headers.items()}
-        logger.info(f"[RAW-REQUEST] 最终headers: {log_headers}")
+
+        # 记录关键请求信息（脱敏 token）
+        log_h = {}
+        for k, v in merged_headers.items():
+            v_str = str(v)
+            if 'token' in k.lower() or 'authorization' in k.lower():
+                log_h[k] = f"{v_str[:20]}...({len(v_str)}ch)"
+            else:
+                log_h[k] = v_str[:80]
+        logger.debug(f"[RAW] headers: {log_h}")
         
         if 'json' in kwargs:
-            logger.info(f"[RAW-REQUEST] Body: {kwargs['json']}")
-        
+            logger.debug(f"[RAW] body: {kwargs['json']}")
+
         # ============================================================
         # 发送实际请求
         # ============================================================
@@ -182,23 +197,21 @@ class AuthSessionContext:
             headers=merged_headers,
             **kwargs,
         )
-        
-        logger.info(f"[RAW-REQUEST] 响应: status={response.status_code}, url={str(response.url)}")
-        logger.info(f"[RAW-REQUEST] content-type: {response.headers.get('content-type', 'N/A')}")
-        
-        # 记录响应的 Set-Cookie
-        try:
-            resp_cookies = dict(response.cookies)
-            if resp_cookies:
-                logger.info(f"[RAW-REQUEST] 响应Set-Cookie: {resp_cookies}")
-        except Exception:
-            pass
+
+        # 记录响应摘要
+        logger.info(
+            f"[RAW] ← {response.status_code} "
+            f"ct={response.headers.get('content-type', '?')[:40]} "
+            f"url={str(response.url)[:80]}"
+        )
         
         ct = response.headers.get('content-type', '')
         if 'text/html' in ct.lower():
-            body_preview = response.text[:300].replace('\n', '\\n')
-            logger.warning(f"[RAW-REQUEST] ⚠️ HTML响应: {body_preview}")
+            logger.debug(f"[RAW] HTML body preview: {response.text[:200].replace(chr(10), ' ')}")
         elif 'application/json' in ct.lower():
-            logger.info(f"[RAW-REQUEST] ✅ JSON响应: {response.text[:200]}")
-        
+            text = response.text[:200]
+            logger.info(f"[RAW] JSON: {text}")
+        else:
+            logger.debug(f"[RAW] body ({len(response.content)} bytes): {response.text[:100]}")
+
         return response

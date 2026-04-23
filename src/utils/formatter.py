@@ -75,8 +75,9 @@ class CardButtonConfig:
                 }
             })
 
-        # 「查看二维码」按钮（签到+签退）
-        if self.show_qr_button:
+        # 「查看二维码」按钮（签到+签退）— 仅对非系列活动（子活动/单次活动）显示
+        # 系列活动应先点「查看子活动」，再对具体场次获取二维码
+        if self.show_qr_button and not act.is_series:
             buttons.append({
                 "tag": "button",
                 "text": {"tag": "plain_text", "content": "查看二维码"},

@@ -342,7 +342,9 @@ class CardActionHandler:
                 except Exception:
                     pass
 
-                button_config = CardButtonConfig()
+                button_config = CardButtonConfig(
+                    show_qr_button=True,  # 子活动显示查看二维码按钮
+                )
 
                 total = len(children)
                 if total <= max_per_card:

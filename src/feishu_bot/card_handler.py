@@ -511,60 +511,89 @@ class CardActionHandler:
         sign_in_b64 = ""
         sign_out_b64 = ""
 
-        # ===== 尝试获取签到码 =====
-        for attempt in range(1, MAX_QR_RETRIES + 1):
-            logger.info(f"[QR] 签到码尝试 {attempt}/{MAX_QR_RETRIES}, scene={activity_id}")
-            
-            try:
-                session_ctx = self._auth_manager.create_session_once()
-                
-                async with session_ctx:
-                    resp = await session_ctx.raw_request(
-                        "POST", qr_api_path, json=qr_payload, headers=qr_headers,
+        # ===== 策略一：走 pyustc 加密 API 通道 =====
+        # /login/wisdom-group-learning-bg/mobile/item/createWxaCodeUnlimit
+        # 这与 pyustc 内部调用报名/查询等 API 的方式完全一致
+        logger.info("[QR] ====== 策略一：加密 API 通道 ======")
+        try:
+            session_ctx = self._auth_manager.create_session_once()
+            async with session_ctx:
+                try:
+                    result = await session_ctx.encrypted_request(
+                        "createWxaCodeUnlimit",
+                        method="post",
+                        json_data=qr_payload,
                     )
-                    
-                    data = self._parse_qr_response(resp)
-                    ct = resp.headers.get('content-type', '')
-                    
-                    # 检查是否拿到有效的 JSON 响应
-                    if isinstance(data, dict) and data.get("success") and data.get("message"):
-                        sign_in_b64 = data["message"]
-                        logger.info(f"[QR] ✅ 签到码成功! (attempt={attempt}, b64len={len(sign_in_b64)})")
+                    if isinstance(result, dict) and result.get("success") and result.get("message"):
+                        sign_in_b64 = result["message"]
+                        logger.info(f"[QR] ✅ 加密通道签到码成功! (b64len={len(sign_in_b64)})")
                         
-                        # 用同一个会话立刻拿签退码
+                        # 签退码
                         try:
-                            resp2 = await session_ctx.raw_request(
-                                "POST", qr_api_path, json=qr_payload, headers=qr_headers,
+                            result2 = await session_ctx.encrypted_request(
+                                "createWxaCodeUnlimit",
+                                method="post",
+                                json_data=qr_payload,
                             )
-                            data2 = self._parse_qr_response(resp2)
-                            if isinstance(data2, dict) and data2.get("success") and data2.get("message"):
-                                sign_out_b64 = data2["message"]
-                                logger.info(f"[QR] ✅ 签退码也成功了! (b64len={len(sign_out_b64)})")
-                            else:
-                                logger.warning(f"[QR] 签退码返回异常: {str(data2)[:150]}")
+                            if isinstance(result2, dict) and result2.get("success") and result2.get("message"):
+                                sign_out_b64 = result2["message"]
+                                logger.info(f"[QR] ✅ 加密通道签退码也成功! (b64len={len(sign_out_b64)})")
                         except Exception as e2:
-                            logger.warning(f"[QR] 签退码请求异常: {e2}")
-                        
-                        break  # 成功了，退出重试循环
-                        
-                    else:
-                        # 这次没成功，记录原因并重试
-                        reason = "HTML错误页" if 'text/html' in ct.lower() else str(data)[:100]
-                        logger.warning(f"[QR] ❌ attempt={attempt} 失败: {reason}")
-                        
-                        if attempt < MAX_QR_RETRIES:
-                            import asyncio
-                            wait_sec = 1.5 * attempt  # 渐进等待：1.5s, 3s
-                            logger.info(f"[QR] 等待 {wait_sec}s 后重试...")
-                            await asyncio.sleep(wait_sec)
-                        continue
+                            logger.warning(f"[QR] 加密通道签退码失败: {e2}")
+                except Exception as e_enc:
+                    logger.warning(f"[QR] 加密通道失败: {e_enc}")
+        except Exception as e_session:
+            logger.warning(f"[QR] 加密通道会话建立失败: {e_session}")
 
-            except Exception as e:
-                logger.warning(f"[QR] attempt={attempt} 异常: {e}")
-                if attempt < MAX_QR_RETRIES:
-                    import asyncio
-                    await asyncio.sleep(1.5 * attempt)
-                    continue
+        # ===== 策略二：如果加密通道失败，降级走前端 session（重试） =====
+        if not sign_in_b64 and not sign_out_b64:
+            logger.info("[QR] ====== 策略二：前端 session 重试 ======")
+            for attempt in range(1, MAX_QR_RETRIES + 1):
+                logger.info(f"[QR] 前端尝试 {attempt}/{MAX_QR_RETRIES}, scene={activity_id}")
+                
+                try:
+                    session_ctx = self._auth_manager.create_session_once()
+                    
+                    async with session_ctx:
+                        resp = await session_ctx.raw_request(
+                            "POST", qr_api_path, json=qr_payload, headers=qr_headers,
+                        )
+                        
+                        data = self._parse_qr_response(resp)
+                        ct = resp.headers.get('content-type', '')
+                        
+                        if isinstance(data, dict) and data.get("success") and data.get("message"):
+                            sign_in_b64 = data["message"]
+                            logger.info(f"[QR] ✅ 前端签到码成功! (attempt={attempt}, b64len={len(sign_in_b64)})")
+                            
+                            try:
+                                resp2 = await session_ctx.raw_request(
+                                    "POST", qr_api_path, json=qr_payload, headers=qr_headers,
+                                )
+                                data2 = self._parse_qr_response(resp2)
+                                if isinstance(data2, dict) and data2.get("success") and data2.get("message"):
+                                    sign_out_b64 = data2["message"]
+                                    logger.info(f"[QR] ✅ 前端签退码也成功!")
+                            except Exception as e2:
+                                logger.warning(f"[QR] 前端签退码请求异常: {e2}")
+                            
+                            break
+                            
+                        else:
+                            reason = "HTML错误页" if 'text/html' in ct.lower() else str(data)[:100]
+                            logger.warning(f"[QR] ❌ 前端attempt={attempt} 失败: {reason}")
+                            
+                            if attempt < MAX_QR_RETRIES:
+                                import asyncio
+                                await asyncio.sleep(1.0)
+                            continue
+
+                except Exception as e:
+                    logger.warning(f"[QR] 前端attempt={attempt} 异常: {e}")
+                    if attempt < MAX_QR_RETRIES:
+                        import asyncio
+                        await asyncio.sleep(1.0)
+                        continue
 
         # ===== 结果汇总 =====
         if not sign_in_b64 and not sign_out_b64:

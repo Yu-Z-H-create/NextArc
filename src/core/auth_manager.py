@@ -176,6 +176,38 @@ class AuthSessionContext:
         await self._cleanup_partial()
         logger.debug("认证会话已关闭")
 
+    async def encrypted_request(self, url: str, method: str = "post", json_data: dict | None = None) -> dict:
+        """通过 pyustc 的加密 API 通道发起请求
+        
+        复用 YouthService 的 request() 方法，走:
+        /login/wisdom-group-learning-bg/{url} + AES加密参数 + x-access-token
+        
+        这与 pyustc 内部调用报名/查询等 API 的方式完全一致。
+        用于尝试调用 createWxaCodeUnlimit 等可能在后端也有映射的 API。
+        """
+        if not self._service or not hasattr(self._service, '_access_token'):
+            raise RuntimeError("YouthService 未登录或无 access_token")
+        
+        service = self._service
+        effective_url = f"/mobile/item/{url.lstrip('/')}"
+        
+        logger.info(f"[ENCRYPTED] {method.upper()} {effective_url}")
+        if json_data:
+            logger.debug(f"[ENCRYPTED] payload: {json_data}")
+        
+        try:
+            result = await service.request(
+                effective_url,
+                method,
+                json=json_data,
+                need_token=True,
+            )
+            logger.info(f"[ENCRYPTED] 响应: {str(result)[:200]}")
+            return result
+        except Exception as e:
+            logger.error(f"[ENCRYPTED] 请求失败: {e}")
+            raise
+
     async def raw_request(self, method: str, url: str, **kwargs) -> httpx.Response:
         """使用前端 session（JSESSIONID）发起原始 HTTP 请求
         

@@ -123,14 +123,15 @@ class AuthSessionContext:
         
         用于调用 pyustc 未封装的 API（如 createWxaCodeUnlimit）。
         
-        策略：直接使用 YouthService._client（已认证的 AsyncClient），
-        它自带 x-access-token、正确 base_url 等完整认证信息。
-        只需要注入 API 特定的 headers。
+        策略演进：
+        v1-v5: 各种独立客户端方案 → 全部失败（被重定向到 main.psp）
+        v6: 直接用 YouthService._client → 仍然失败
+        v7 (当前): 先预热获取 JSESSIONID，再用完整认证信息发请求
         
         关键发现：
-        - YouthService._client.cookies 为空，认证靠 x-access-token (JWT) header
-        - 服务端对 /mobile/item/* 路径有特殊的路由重定向行为
-        - 必须用 YouthService 自身的客户端，不能创建独立客户端
+        - 服务端对 /mobile/item/* 路径有页面路由框架（Spring MVC?）
+        - 无 JSESSIONID 时，POST 被当成表单提交→重定向到错误页面
+        - 需要先通过 GET 建立服务端 session，获得有效 JSESSIONID
         """
         base_url = "https://young.ustc.edu.cn"
         full_url = url if url.startswith("http") else base_url.rstrip("/") + "/" + url.lstrip("/")
@@ -142,25 +143,39 @@ class AuthSessionContext:
         
         client = self._service._client
         
-        # 打印客户端状态用于诊断
-        logger.info(f"[RAW-REQUEST] 使用 YouthService._client:")
-        logger.info(f"[RAW-REQUEST]   base_url={client.base_url}")
-        logger.info(f"[RAW-REQUEST]   headers keys={list(dict(client.headers).keys())}")
-        logger.info(f"[RAW-REQUEST]   cookies={list(dict(client.cookies).keys())} ({len(list(client.cookies))}个)")
-        logger.info(f"[RAW-REQUEST]   follow_redirects={getattr(client, 'follow_redirects', 'N/A')}")
+        # ============================================================
+        # Step 0: 预热 - 访问一个页面获取 JSESSIONID
+        # ============================================================
+        logger.info("[RAW-REQUEST] Step 0: 预热获取 JSESSIONID...")
+        try:
+            warm_resp = await client.get(base_url + "/mobile/index", headers={"Accept": "text/html"})
+            warm_cookies = dict(warm_resp.cookies)
+            logger.info(f"[RAW-REQUEST] 预热响应: status={warm_resp.status_code}, cookies={list(warm_cookies.keys())}")
+            
+            # 提取 JSESSIONID
+            jsession_id = warm_cookies.get('JSESSIONID', '')
+            if jsession_id:
+                logger.info(f"[RAW-REQUEST] ✅ 获取到 JSESSIONID: {jsession_id}")
+        except Exception as e:
+            logger.warning(f"[RAW-REQUEST] ⚠️ 预热失败(非致命): {e}")
+            jsession_id = ''
         
-        # 合并自定义 headers 到已有 headers 中
+        # ============================================================
+        # 构建最终请求头
+        # ============================================================
         merged_headers = dict(client.headers)
         custom_headers = kwargs.pop('headers', {})
         merged_headers.update(custom_headers)
         
-        # 记录实际发送的 headers（隐藏 token 值）
-        log_headers = {k: (v[:20]+'...' if len(str(v))>20 else v) for k,v in merged_headers.items()}
+        log_headers = {k: (str(v)[:30]+'...' if len(str(v))>30 else str(v)) for k,v in merged_headers.items()}
         logger.info(f"[RAW-REQUEST] 最终headers: {log_headers}")
         
-        logger.info(f"[RAW-REQUEST] Body: {kwargs.get('json', kwargs.get('data', '(无body)'))}")
+        if 'json' in kwargs:
+            logger.info(f"[RAW-REQUEST] Body: {kwargs['json']}")
         
-        # 直接用 YouthService 的已认证客户端发请求（它会自动处理重定向和认证）
+        # ============================================================
+        # 发送实际请求
+        # ============================================================
         response = await client.request(
             method.upper(),
             full_url,
@@ -169,11 +184,21 @@ class AuthSessionContext:
         )
         
         logger.info(f"[RAW-REQUEST] 响应: status={response.status_code}, url={str(response.url)}")
-        logger.info(f"[RAW-REQUEST] 响应content-type: {response.headers.get('content-type', 'N/A')}")
+        logger.info(f"[RAW-REQUEST] content-type: {response.headers.get('content-type', 'N/A')}")
         
-        # 检查是否是 HTML 错误页
+        # 记录响应的 Set-Cookie
+        try:
+            resp_cookies = dict(response.cookies)
+            if resp_cookies:
+                logger.info(f"[RAW-REQUEST] 响应Set-Cookie: {resp_cookies}")
+        except Exception:
+            pass
+        
         ct = response.headers.get('content-type', '')
         if 'text/html' in ct.lower():
-            logger.warning(f"[RAW-REQUEST] ⚠️ 收到HTML响应(非JSON)，前200字: {response.text[:200]}")
+            body_preview = response.text[:300].replace('\n', '\\n')
+            logger.warning(f"[RAW-REQUEST] ⚠️ HTML响应: {body_preview}")
+        elif 'application/json' in ct.lower():
+            logger.info(f"[RAW-REQUEST] ✅ JSON响应: {response.text[:200]}")
         
         return response

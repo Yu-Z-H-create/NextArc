@@ -521,17 +521,25 @@ class CardActionHandler:
                     logger.warning(f"[QR] 签到码API返回异常: status={sign_in_resp.status_code}, data={str(sign_in_data)[:200]}")
 
                 # ===== 签退码请求（同一个 activity_id） =====
-                sign_out_resp = await session_ctx.raw_request(
-                    "POST", qr_api_path, json=qr_payload, headers=qr_headers,
-                )
+                try:
+                    sign_out_resp = await session_ctx.raw_request(
+                        "POST", qr_api_path, json=qr_payload, headers=qr_headers,
+                    )
+                except Exception as e2:
+                    logger.warning(f"[QR] 签退码请求异常: {e2}")
+                    sign_out_resp = None
                 
-                sign_out_data = self._parse_qr_response(sign_out_resp)
-                sign_out_b64 = ""
-                if isinstance(sign_out_data, dict) and sign_out_data.get("success"):
-                    sign_out_b64 = sign_out_data.get("message") or ""
-                    logger.info(f"[QR] 签退码获取成功 (base64长度: {len(sign_out_b64)})")
+                if sign_out_resp:
+                    sign_out_data = self._parse_qr_response(sign_out_resp)
+                    sign_out_b64 = ""
+                    if isinstance(sign_out_data, dict) and sign_out_data.get("success"):
+                        sign_out_b64 = sign_out_data.get("message") or ""
+                        logger.info(f"[QR] 签退码获取成功 (base64长度: {len(sign_out_b64)})")
+                    else:
+                        logger.warning(f"[QR] 签退码API返回异常: status={sign_out_resp.status_code}, data={str(sign_out_data)[:200]}")
                 else:
-                    logger.warning(f"[QR] 签退码API返回异常: status={sign_out_resp.status_code}, data={str(sign_out_data)[:200]}")
+                    sign_out_data = {"success": False}
+                    sign_out_b64 = ""
 
             if not sign_in_b64 and not sign_out_b64:
                 return {

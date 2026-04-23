@@ -144,11 +144,13 @@ class AuthSessionContext:
         client = self._service._client
         
         # ============================================================
-        # Step 0: 预热 - 用 GET 建立服务端 JSESSIONID session
+        # Step 0: 模拟浏览器完整访问路径
+        #   0a. 访问 mobile/index 获取 JSESSIONID
+        #   0b. 如果目标与活动相关，访问活动详情页建立页面 session
         # ============================================================
         jsession_id = ''
         try:
-            logger.debug("[RAW] 预热: GET /mobile/index")
+            logger.debug("[RAW] 预热0a: GET /mobile/index")
             warm_resp = await client.get(
                 base_url + "/mobile/index",
                 headers={"Accept": "text/html,application/xhtml+xml"},
@@ -159,12 +161,38 @@ class AuthSessionContext:
                     jsession_id = cookie.value
                     break
             
-            # 把预热获得的 cookie 注入到 client 的 cookie jar 中
-            # 这样后续请求会自动带上 JSESSIONID
             if jsession_id:
                 logger.debug(f"[RAW] 预热获得 JSESSIONID: {jsession_id[:8]}...")
             else:
-                logger.debug(f"[RAW] 预热未返回 JSESSIONID, 响应status={warm_resp.status_code}")
+                logger.debug(f"[RAW] 预热未返回 JSESSIONID, status={warm_resp.status_code}")
+            
+            # 0b: 如果请求的是 createWxaCodeUnlimit，从 scene 参数提取 activity_id，
+            #     先访问活动详情页（模拟浏览器行为）
+            payload = kwargs.get('json', {})
+            scene = payload.get('scene', '') if isinstance(payload, dict) else ''
+            
+            if 'createWxaCodeUnlimit' in full_url and scene:
+                detail_url = f"{base_url}/mobile/item/projectdt?id={scene}"
+                logger.debug(f"[RAW] 预热0b: GET 活动详情页 {detail_url}")
+                try:
+                    detail_resp = await client.get(
+                        detail_url,
+                        headers={
+                            "Accept": "text/html,application/xhtml+xml",
+                            "Referer": f"{base_url}/mobile/index",
+                        },
+                        follow_redirects=True,
+                    )
+                    logger.debug(f"[RAW] 详情页响应: status={detail_resp.status_code}, "
+                                f"ct={detail_resp.headers.get('content-type','')[:40]}")
+                    
+                    # 收集新 cookies
+                    for cookie in detail_resp.cookies.jar:
+                        if cookie.name == 'JSESSIONID':
+                            jsession_id = cookie.value
+                except Exception as e_detail:
+                    logger.warning(f"[RAW] 详情页预热失败(非致命): {e_detail}")
+
         except Exception as e:
             logger.warning(f"[RAW] 预热失败(非致命): {e}")
 
@@ -205,9 +233,26 @@ class AuthSessionContext:
             f"url={str(response.url)[:80]}"
         )
         
+        # 诊断：记录发送时的完整 cookies
+        try:
+            req_cookies = {c.name: c.value[:20] for c in client.cookies.jar}
+            if req_cookies:
+                logger.debug(f"[RAW] 发送的cookies: {req_cookies}")
+        except Exception:
+            pass
+        
         ct = response.headers.get('content-type', '')
         if 'text/html' in ct.lower():
-            logger.debug(f"[RAW] HTML body preview: {response.text[:200].replace(chr(10), ' ')}")
+            # 错误页：记录更多内容帮助诊断
+            text = response.text
+            logger.debug(f"[RAW] HTML body ({len(text)} chars): {text[:500].replace(chr(10), ' ')}")
+            
+            # 尝试提取页面标题/错误信息
+            import re
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
+            if title_match:
+                title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip()
+                logger.debug(f"[RAW] 页面title: {title}")
         elif 'application/json' in ct.lower():
             text = response.text[:200]
             logger.info(f"[RAW] JSON: {text}")
